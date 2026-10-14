@@ -145,6 +145,12 @@ function apply(ctx, config) {
   const turnStarts = new Map();
   /** session keys seen this process (for final L1 flush on teardown). */
   const seenSessions = new Set();
+  /** Bound the per-session bookkeeping in long-lived (web) hosts: Map/Set
+   *  insertion order makes the oldest session the first to evict. */
+  const MAX_TRACKED_SESSIONS = 256;
+  function trim(tracked) {
+    while (tracked.size > MAX_TRACKED_SESSIONS) tracked.delete(tracked.keys().next().value);
+  }
   /** recall cache per session: same user text within TTL reuses the result. */
   const recallCache = createRecallCache();
 
@@ -171,7 +177,7 @@ function apply(ctx, config) {
   // ── core construction (rebuildable) ──────────────────────────────────────
   async function build(cfg) {
     if (cfg?.llm?.apiKey) {
-      log("debug", `build: using settings config (apiKey=${cfg.llm.apiKey.slice(0, 6)}…)`);
+      log("debug", "build: using settings config (apiKey=<set>)");
     }
     // Tear down the previous core, if any (first build has none).
     const previous = core;
@@ -181,11 +187,19 @@ function apply(ctx, config) {
       });
     }
     dataDir = cfg.dataDir || join(os.homedir(), ".memory-tencentdb", "memory-tdai");
+    // No silent-broken extraction: a missing model must disable L1 explicitly
+    // (parseConfig would otherwise fall back to its own placeholder model and
+    // every extraction call would fail against the configured endpoint).
+    const llmModel = cfg.llm.model || process.env.TDAI_LLM_MODEL || "";
+    const extractionEnabled = cfg.extraction.enabled && !!llmModel;
+    if (cfg.extraction.enabled && !llmModel) {
+      log("warn", "no extraction model configured (llm.model / TDAI_LLM_MODEL); L1 extraction stays disabled — capture and search still work");
+    }
     const nextConfig = parseConfig({
       timezone: "system",
       storeBackend: "sqlite",
       capture: { enabled: cfg.captureEnabled },
-      extraction: { enabled: cfg.extraction.enabled, enableDedup: cfg.extraction.enableDedup },
+      extraction: { enabled: extractionEnabled, enableDedup: cfg.extraction.enableDedup },
       recall: { ...cfg.recall },
       embedding: {
         enabled: true,
@@ -201,7 +215,7 @@ function apply(ctx, config) {
         enabled: true,
         baseUrl: cfg.llm.baseUrl || process.env.TDAI_LLM_BASE_URL || "",
         apiKey: cfg.llm.apiKey || process.env.TDAI_LLM_API_KEY || "",
-        model: cfg.llm.model || process.env.TDAI_LLM_MODEL || "deepseek-v4-flash",
+        model: llmModel,
         maxTokens: cfg.llm.maxTokens,
         timeoutMs: cfg.llm.timeoutMs,
         sendSessionHeader: cfg.llm.sendSessionHeader,
@@ -234,7 +248,7 @@ function apply(ctx, config) {
     recallCache.clear();
     await nextCore.initialize();
     const key = nextConfig.llm.apiKey || "";
-    log("info", `initialized (dataDir=${dataDir}, llm=${nextConfig.llm.model}, apiKey=${key ? `${key.slice(0, 6)}…` : "<empty>"}, embedding=${nextConfig.embedding.model})`);
+    log("info", `initialized (dataDir=${dataDir}, llm=${nextConfig.llm.model}, apiKey=${key ? "<set>" : "<empty>"}, embedding=${nextConfig.embedding.model})`);
   }
 
   // ── capture: triggered on session/flush (awaitable; runs before process
@@ -242,8 +256,10 @@ function apply(ctx, config) {
   ctx.on("session/event", (session, event) => {
     if (event.type === "turn/start") {
       turnStarts.set(session.id, event.time);
+      trim(turnStarts);
     } else if (event.type === "turn/end") {
       lastTurnEnd.set(session.id, event.data.turn);
+      trim(lastTurnEnd);
     }
   });
 
@@ -252,7 +268,9 @@ function apply(ctx, config) {
       const turnId = lastTurnEnd.get(session.id);
       if (turnId === undefined || capturedTurns.get(session.id) === turnId) return;
       capturedTurns.set(session.id, turnId);
+      trim(capturedTurns);
       seenSessions.add(session.id);
+      trim(seenSessions);
       const startedAt = turnStarts.get(session.id) ?? Date.now();
       await captureTurn(session, startedAt);
       if (isOneShot) {
@@ -288,7 +306,7 @@ function apply(ctx, config) {
           id: m.id ?? `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
           role: m.role === "assistant" ? "assistant" : "user",
           content: text,
-          timestamp: Date.now(),
+          timestamp: m.timestamp ?? startedAt ?? Date.now(),
         };
       })
       .filter(Boolean);
@@ -482,7 +500,9 @@ function apply(ctx, config) {
   setTimeout(() => {
     if (!builtOnce) {
       builtOnce = true;
-      void build(runtimeConfigOf(config));
+      void build(runtimeConfigOf(config)).catch((error) => {
+        log("error", `initialization failed: ${String(error)}`);
+      });
     }
   }, 500);
 

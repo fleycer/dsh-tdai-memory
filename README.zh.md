@@ -16,17 +16,23 @@
 
 把 **TencentDB Agent Memory**（腾讯云开源的四层记忆系统，原为 OpenClaw 插件）移植进 DeepSeek Harness。
 
-## 兼容性（v0.4.1）
+## 兼容性（v0.5.0）
 
-已在 DSH `0.1.7-rc.2`（Web）与 `0.2.0-rc.2`（桌面端运行时）的一次性 Profile 验证。桌面端使用独立的 `desktop` Profile；其他预发布版本暂未验证。
+本版本要求 DSH `0.2.0-rc.2` 或更新的 `0.2.x` 宿主（manifest 中的
+`dsh.compatibility.dsh` 范围），已在 DSH `0.2.0-rc.2` 的独立 Profile 验证。
+自 v0.4.0 起不再支持 DSH `0.1.x`：旧版 `0.1.x` 宿主请锁定
+`dsh-tdai-memory@0.3.6`；DSH `0.1.0-rc.6` 请锁定 `dsh-tdai-memory@0.2.11`
+（最后一个包含旧 settings 白名单兼容补丁的版本）。其他预发布版本暂未验证。
 
 ## 桌面端安装
 
 在桌面端的“插件”页面安装，或使用桌面端“应用 → 管理 dsh 命令”注册的命令：
 
 ```powershell
-dsh plugin --profile desktop add dsh-tdai-memory@0.3.6
+dsh plugin --profile desktop add dsh-tdai-memory
 ```
+
+旧版 DSH `0.1.x` 宿主见上文兼容性说明。
 
 重启桌面端以加载客户端插件。配置位于 `$DSH_HOME/profiles/desktop`。
 
@@ -43,15 +49,14 @@ dsh plugin --profile desktop add dsh-tdai-memory@0.3.6
 
 `node-llama-cpp` 仅供完全本地的 embedding 后端使用，现在声明为可选 peer，默认安装不会再触发原生构建脚本。使用 OpenAI 兼容远程 embedding 时不需要它；选择本地后端的用户需在目标 DSH profile 中单独安装并批准 `node-llama-cpp` 的构建。
 
-从 `0.2.13` 起最低支持 DSH `0.1.0-rc.7`，已针对 `0.1.0-rc.7`、
-`0.1.0-rc.8` 和 `0.1.1-rc.1` 测试。仍使用 DSH `0.1.0-rc.6` 的用户请锁定
-`dsh-tdai-memory@0.2.11`；这是最后一个包含旧 settings 白名单兼容补丁的版本。
+L1 提取需要显式配置 `llm.model`（或 `TDAI_LLM_MODEL`）。未配置时 v0.5.0+
+会警告并禁用提取，而不会用占位模型调用 LLM 端点；捕获与检索不受影响。
 
 ## 架构（移植方式）
 
 | 层 | 内容 |
 |---|---|
-| 核心 | `tdai-memory-openclaw-plugin` 的 host-neutral 核心（`src/core`、`src/utils`），tsc 编译为 ESM（`dist-dsh/`），零改动 |
+| 核心 | `tdai-memory-openclaw-plugin` 的 host-neutral 核心（`src/core`、`src/utils`），tsc 编译为 ESM（`vendor/tdai/`），零改动（上游版本与重建步骤见 [VENDOR.md](VENDOR.md)） |
 | 宿主适配 | `StandaloneHostAdapter`（官方 standalone 模式，OpenAI 兼容直调） |
 | dsh 壳 | `index.js`：配置映射、`session/event`+`session/flush` 捕获、`agent.ctx` 上的 `system-prompt/assemble` waterfall 召回注入、工具注册、生命周期 |
 | 备用 | `recall-inject.js`：preset 行形态的召回注入（挂在 agent preset 内时用） |
@@ -90,7 +95,7 @@ tdai-memory:
       enableDedup: false      # dedup 的 LLM 输出解析不稳，先关
     llm:                      # L1/L2/L3 提取模型（OpenAI 兼容）
       baseUrl: 'https://opencode.ai/zen/go/v1'
-      model: 'mimo-v2.5'      # deepseek-v4-flash 对提取 JSON 输出不合格
+      model: 'mimo-v2.5'      # 提取必须显式配置；deepseek-v4-flash 对提取 JSON 输出不合格
       sendSessionHeader: true # 给 LLM 请求带 x-opencode-session（OpenCode Go 等网关要求）
       sessionId: ''           # 固定会话 ID；留空 = 数据目录下自动持久化 ID（重启不变）
     embedding:                # 向量（OpenAI 兼容 /v1/embeddings）
@@ -102,11 +107,11 @@ tdai-memory:
 
 ## 已知取舍
 
-- **提取模型**：`mimo-v2.5` 提取正确但单次 20-30s（后台执行，不阻塞对话）；`deepseek-v4-flash` 快但 JSON 输出不合规（提取 0 条）
+- **提取模型**：需显式配置（`llm.model` / `TDAI_LLM_MODEL`），v0.5.0+ 不再提供提取默认值；`mimo-v2.5` 提取正确但单次 20-30s（后台执行，不阻塞对话）；`deepseek-v4-flash` 快但 JSON 输出不合规（提取 0 条）
 - **dedup**：LLM 冲突检测输出解析不稳（曾导致 stored=0），默认关闭；开启需换更稳的模型
 - **L1 记忆向量**：随存储写入（8088 embedding 快）；L0 向量走后台任务，headless 退出时由 `destroy()` drain
 - **搜索工具**（`toolsEnabled`，默认开启）：开关在插件页，切换后**原地生效**（行配置是 `volatile`，无需重启即重新注册）。若两个工具完全缺失，可查插件日志 `[tdai-memory] tools registered: …`（v0.4.1 起）；v0.4.1 之前它读的是 cordis 交给 `apply` 的 Volatile 包装对象上的 `config.toolsEnabled` —— 那个属性永远不存在，因此整个失败过程完全静默（issue #3）
-- **升级**：上游拉新代码后，在 tdai 项目目录重跑 `npx tsc -p dsh-tsconfig.json`（产物在 `dist-dsh/`）
+- **升级**：`vendor/tdai/` 是上游核心的冻结编译快照；上游版本、已知差距（offload / Mermaid 短期记忆压缩尚未移植）与重建步骤见 [VENDOR.md](VENDOR.md)
 
 
 保存使用配置表单 API；宿主拒绝写入时保留草稿并提示错误。只修改模型不会覆盖密钥，关闭默认开启的选项会显式保存 `false`。

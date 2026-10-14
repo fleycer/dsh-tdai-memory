@@ -10,7 +10,7 @@ Choose **Automatic memory** for capture, extraction, recall and search together;
 
 [![中文文档](https://img.shields.io/badge/%E4%B8%AD%E6%96%87%E6%96%87%E6%A1%A3-blue)](README.zh.md)
 
-**GitHub**: [Scorp1o117/dsh-tdai-memory](https://github.com/Scorp1o117/dsh-tdai-memory) · **npm**: [dsh-tdai-memory](https://www.npmjs.com/package/dsh-tdai-memory)
+**GitHub**: [fleycer/dsh-tdai-memory](https://github.com/fleycer/dsh-tdai-memory) (fork of [Scorp1o117/dsh-tdai-memory](https://github.com/Scorp1o117/dsh-tdai-memory)) · **npm**: [dsh-tdai-memory](https://www.npmjs.com/package/dsh-tdai-memory)
 
 [![Enhancement Suite](https://img.shields.io/badge/part%20of-Enhancement%20Suite-3964fe)](https://github.com/Scorp1o117/dsh-enhancement-suite) [![npm](https://img.shields.io/npm/v/dsh-enhancement-suite)](https://www.npmjs.com/package/dsh-enhancement-suite)
 
@@ -19,17 +19,25 @@ Part of the [DeepSeek Harness Enhancement Suite](https://github.com/Scorp1o117/d
 A port of **TencentDB Agent Memory** (Tencent Cloud's open-source four-layer
 memory system, originally an OpenClaw plugin) into DeepSeek Harness.
 
-## Compatibility (v0.4.1)
+## Compatibility (v0.5.0)
 
-Verified with DSH `0.1.7-rc.2` (Web) and `0.2.0-rc.2` (Desktop runtime) in isolated profiles. The Desktop app uses its own `desktop` profile. Other DSH prereleases remain unverified.
+This version requires DSH `0.2.0-rc.2` or a later `0.2.x` host (the manifest's
+`dsh.compatibility.dsh` range). It was verified with DSH `0.2.0-rc.2` in an
+isolated profile. DSH `0.1.x` is not supported from v0.4.0 on — legacy `0.1.x`
+hosts should pin `dsh-tdai-memory@0.3.6`, and DSH `0.1.0-rc.6` hosts
+`dsh-tdai-memory@0.2.11` (the last release with the legacy settings-allowlist
+compatibility patch). Other DSH prereleases remain unverified.
 
 ## Desktop install
 
 Use the Desktop-installed `dsh` command (Application → Manage dsh Command), or the app’s Plugins page. Then install into the Desktop profile:
 
 ```powershell
-dsh plugin --profile desktop add dsh-tdai-memory@0.3.6
+dsh plugin --profile desktop add dsh-tdai-memory
 ```
+
+The Desktop app uses its own `desktop` profile. For legacy DSH `0.1.x` hosts see
+the Compatibility section above.
 
 Restart the Desktop app to load the client bundle. Desktop keeps its profile under `$DSH_HOME/profiles/desktop`.
 
@@ -56,7 +64,7 @@ The data directory reuses the existing `~/.memory-tencentdb/memory-tdai`, so
 
 | Layer | Content |
 |---|---|
-| Core | The host-neutral core of `tdai-memory-openclaw-plugin` (`src/core`, `src/utils`), tsc-compiled to ESM (`dist-dsh/`), zero changes |
+| Core | The host-neutral core of `tdai-memory-openclaw-plugin` (`src/core`, `src/utils`), tsc-compiled to ESM (`vendor/tdai/`), zero changes — see [VENDOR.md](VENDOR.md) for the upstream pin and rebuild steps |
 | Host adapter | `StandaloneHostAdapter` (official standalone mode, direct OpenAI-compatible calls) |
 | dsh shell | `index.js`: config mapping, `session/event` + `session/flush` capture, `system-prompt/assemble` recall injection on `agent.ctx`, tool registration, lifecycle |
 | Fallback | `recall-inject.js`: preset-row recall injection (used when mounted inside an agent preset) |
@@ -95,7 +103,7 @@ startup, so changes apply **after a restart**.
       enableDedup: false      # dedup LLM output parsing is flaky; off by default
     llm:                      # L1/L2/L3 extraction model (OpenAI-compatible)
       baseUrl: 'https://opencode.ai/zen/go/v1'
-      model: 'mimo-v2.5'      # deepseek-v4-flash produces invalid extraction JSON
+      model: 'mimo-v2.5'      # required for extraction; deepseek-v4-flash produces invalid extraction JSON
       sendSessionHeader: true # send x-opencode-session on LLM requests (required by OpenCode Go & similar gateways)
       sessionId: ''           # fixed session id; empty = persistent auto id under the data dir
     embedding:                # vectors (OpenAI-compatible /v1/embeddings)
@@ -130,10 +138,9 @@ settings page (记忆 / Memory) or in the `tdai-memory` Profile patch entry.
 > - DSH exposes the registered `tdai-memory` settings namespace directly; the
 >   plugin does not modify files in the host installation.
 > - Settings changes apply **after a restart** (TdaiCore is built at startup).
-> - Version 0.2.13 and newer require DSH `0.1.0-rc.7` or newer and are tested
->   against `0.1.0-rc.7`, `0.1.0-rc.8`, and `0.1.1-rc.1`.
-> - DSH `0.1.0-rc.6` users must pin `dsh-tdai-memory@0.2.11`, the last release
->   carrying the legacy settings-allowlist compatibility patch.
+> - L1 extraction needs an explicit `llm.model` (or `TDAI_LLM_MODEL`). Without
+>   one, v0.5.0+ disables extraction with a warning instead of calling the LLM
+>   endpoint with a placeholder model — capture and search keep working.
 
 `node-llama-cpp` is an optional peer used only by the fully local embedding
 backend. It is intentionally not installed by default because its native build
@@ -143,8 +150,9 @@ not need it. Users who select the local backend should install and approve
 
 ## Known trade-offs
 
-- **Extraction model**: `mimo-v2.5` extracts correctly but takes 20-30s per
-  call (background execution, does not block the conversation);
+- **Extraction model**: pick one explicitly (`llm.model` / `TDAI_LLM_MODEL`);
+  v0.5.0+ has no extraction default. `mimo-v2.5` extracts correctly but takes
+  20-30s per call (background execution, does not block the conversation);
   `deepseek-v4-flash` is fast but its JSON output is non-compliant (extracts 0)
 - **dedup**: LLM conflict-detection output parsing is unstable (once caused
   stored=0); off by default; enable only with a more reliable model
@@ -158,8 +166,10 @@ not need it. Users who select the local backend should install and approve
   log line (v0.4.1+). Before v0.4.1 it read `config.toolsEnabled` off the
   Volatile wrapper cordis hands to `apply` — a property that never exists — so
   the failure was completely silent (issue #3)
-- **Upgrades**: after pulling new upstream code, rerun
-  `npx tsc -p dsh-tsconfig.json` in the tdai project dir (output in `dist-dsh/`)
+- **Upgrades**: `vendor/tdai/` is a frozen tsc-compiled snapshot of the
+  upstream core; see [VENDOR.md](VENDOR.md) for the upstream pin, the known
+  drift (offload / Mermaid short-term compression is not ported yet) and the
+  rebuild steps
 
 ## License
 

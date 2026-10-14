@@ -1,0 +1,21 @@
+{
+  "//": "Build config for the vendored upstream core (see VENDOR.md). Place this file at the root of a TencentDB-Agent-Memory checkout and run: npx tsc -p dsh-tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "nodenext",
+    "rootDir": "src",
+    "outDir": "vendor/tdai",
+    "strict": false,
+    "skipLibCheck": true,
+    "declaration": false,
+    "sourceMap": false,
+    "esModuleInterop": true
+  },
+  "include": [
+    "src/config.ts",
+    "src/core/**/*.ts",
+    "src/utils/**/*.ts",
+    "src/adapters/standalone/**/*.ts"
+  ]
+}
