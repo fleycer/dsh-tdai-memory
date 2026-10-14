@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1 (packaging fix)
+
+- `package.json` `"files"` now packs `offload-runtime.js` (v0.6.0 shipped
+  installs where `index.js` imported a module that was never packed — plugin
+  load failed), plus `CHANGELOG.md` / `VENDOR.md`. `tests/install-contract.test.mjs`
+  now enforces that every runtime module stays inside the whitelist.
+
 ## 0.6.0 (vendor sync + context offload)
 
 - **Vendored upstream core synced to
