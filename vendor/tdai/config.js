@@ -6,7 +6,6 @@
  *
  * Minimal config (zero config): {} — all fields have sensible defaults.
  */
-import { normalizeDisableThinking } from "./utils/no-think-fetch.js";
 // ============================
 // Parser
 // ============================
@@ -143,18 +142,28 @@ export function parseConfig(raw) {
     };
     // --- Offload ---
     const offloadGroup = obj(c, "offload");
+    // Auto-derive offload serverUrl/apiKey/serviceId from top-level server config
+    // when offload client fields are not explicitly set.
+    const serverGroup = obj(c, "server");
+    const serverUrl = optStr(serverGroup, "url");
+    const serverApiKey = optStr(serverGroup, "apiKey");
+    const serverInstanceId = optStr(serverGroup, "instanceId");
     const offloadMode = (() => {
         const raw = optStr(offloadGroup, "mode");
-        if (raw === "local" || raw === "backend" || raw === "collect")
+        if (raw === "local" || raw === "backend" || raw === "client" || raw === "collect")
             return raw;
-        return optStr(offloadGroup, "backendUrl") ? "backend" : "local";
+        // Auto-derive: if backendUrl is set → "backend"; if server.url is set → "client"; else "local"
+        if (optStr(offloadGroup, "backendUrl"))
+            return "backend";
+        if (serverUrl)
+            return "client";
+        return "local";
     })();
     const offload = {
         enabled: bool(offloadGroup, "enabled") ?? false,
         mode: offloadMode,
         model: optStr(offloadGroup, "model"),
         temperature: num(offloadGroup, "temperature") ?? 0.2,
-        disableThinking: normalizeDisableThinking(boolOrStr(offloadGroup, "disableThinking")),
         forceTriggerThreshold: num(offloadGroup, "forceTriggerThreshold") ?? 4,
         dataDir: optStr(offloadGroup, "dataDir"),
         defaultContextWindow: num(offloadGroup, "defaultContextWindow") ?? 200000,
@@ -170,9 +179,15 @@ export function parseConfig(raw) {
         offloadRetentionDays: normalizeOffloadRetentionDays(num(offloadGroup, "offloadRetentionDays") ?? 0),
         logMaxSizeMb: num(offloadGroup, "logMaxSizeMb") ?? 50,
         userId: optStr(offloadGroup, "userId"),
+        // Client mode fields — fall back to top-level server config when not explicitly set
+        serverUrl: optStr(offloadGroup, "serverUrl") ?? serverUrl,
+        apiKey: optStr(offloadGroup, "apiKey") ?? serverApiKey,
+        serviceId: optStr(offloadGroup, "serviceId") ?? serverInstanceId,
+        compactionRatio: num(offloadGroup, "compactionRatio") ?? 0.5,
+        ingestTimeoutMs: num(offloadGroup, "ingestTimeoutMs") ?? 5000,
+        compactionTimeoutMs: num(offloadGroup, "compactionTimeoutMs") ?? 30000,
     };
     return {
-        timezone: str(c, "timezone") ?? "system",
         capture: {
             enabled: bool(captureGroup, "enabled") ?? true,
             excludeAgents: strArray(captureGroup, "excludeAgents") ?? [],
@@ -256,10 +271,6 @@ export function parseConfig(raw) {
                 model: str(llmGroup, "model") ?? "gpt-4o",
                 maxTokens: num(llmGroup, "maxTokens") ?? 4096,
                 timeoutMs: num(llmGroup, "timeoutMs") ?? 120_000,
-                disableThinking: normalizeDisableThinking(boolOrStr(llmGroup, "disableThinking")),
-                sendSessionHeader: bool(llmGroup, "sendSessionHeader") ?? true,
-                sessionHeaderName: str(llmGroup, "sessionHeaderName") ?? "x-opencode-session",
-                sessionId: str(llmGroup, "sessionId") ?? "",
             };
         })(),
         offload,
@@ -288,15 +299,6 @@ function num(src, key) {
 function bool(src, key) {
     const v = src[key];
     return typeof v === "boolean" ? v : undefined;
-}
-/** Read a field that may be boolean or string. */
-function boolOrStr(src, key) {
-    const v = src[key];
-    if (typeof v === "boolean")
-        return v;
-    if (typeof v === "string" && v.trim())
-        return v.trim();
-    return undefined;
 }
 function strArray(src, key) {
     const v = src[key];

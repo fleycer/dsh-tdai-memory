@@ -24,7 +24,16 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { TdaiCore } from "./vendor/tdai/core/tdai-core.js";
 import { parseConfig } from "./vendor/tdai/config.js";
 import { StandaloneHostAdapter } from "./vendor/tdai/adapters/standalone/host-adapter.js";
+import { registerOffload } from "./vendor/tdai/offload/index.js";
 import { createRecallCache, recallWithTimeout } from "./recall-runtime.js";
+import {
+  buildToolPairEvent,
+  extractMmdText,
+  extractText,
+  mapForOffload,
+  safeJson,
+  safeStringify,
+} from "./offload-runtime.js";
 
 /** Cordis plugin name. */
 const name = "tdai-memory";
@@ -78,6 +87,26 @@ const Config = z.object({
     scoreThreshold: z.number().default(0.3),
     timeoutMs: z.number().default(3000),
   }).default({}),
+  /** Context offload (upstream `src/offload`): tool-pair offload + L1.5 task
+   *  judgment + Mermaid short-term memory (MMD) injected as prompt context.
+   *  Consumes LLM calls on its own endpoint, so it is off by default. */
+  offload: z.object({
+    enabled: z.boolean().default(false),
+    /** Model for offload's own LLM calls, "provider/model-id". The provider
+     *  part is a label; the endpoint always comes from llm.baseUrl/llm.apiKey.
+     *  Empty = llm.model. Model ids must not contain "/". */
+    model: z.string().default(""),
+    /** Offload data dir; default: ~/.memory-tencentdb/context-offload. */
+    dataDir: z.string().default(""),
+    temperature: z.number().default(0.2),
+    /** Assumed context window in tokens (MMD budget base). */
+    contextWindow: z.number().default(200000),
+    /** Max share of the context window the injected MMD may occupy. */
+    mmdMaxTokenRatio: z.number().default(0.2),
+    /** Tool pairs pending in a session that force an L1 extraction flush. */
+    forceTriggerThreshold: z.number().default(4),
+    maxPairsPerBatch: z.number().default(20),
+  }).default({}),
   /** Register the two search tools. */
   toolsEnabled: z.boolean().default(true),
 }).volatile();
@@ -96,16 +125,9 @@ function isRealUserMessage(m) {
   return m?.role === "user" && (m.source == null || m.source.kind === "user");
 }
 
-/** Extract plain text from a dsh message content (block array or string). */
-function extractText(content) {
-  if (typeof content === "string") return content.trim();
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((b) => b && b.type === "text" && typeof b.text === "string")
-    .map((b) => b.text)
-    .join("\n")
-    .trim();
-}
+// Message-shape helpers for the offload integration (extractText, safeJson,
+// safeStringify, mapForOffload, extractMmdText, buildToolPairEvent) live in
+// offload-runtime.js — pure and unit-tested in tests/offload-runtime.test.mjs.
 
 /**
  * Resolve the config value handed to `apply`.
@@ -153,6 +175,29 @@ function apply(ctx, config) {
   }
   /** recall cache per session: same user text within TTL reuses the result. */
   const recallCache = createRecallCache();
+
+  // ── context-offload runtime (rebuildable with the core) ──────────────────
+  // `offloadRuntime` is set by build() when `offload.enabled`; every consumer
+  // reads it at call time so a disabled or half-built runtime degrades to a
+  // no-op. `hooks` maps upstream hook names (before_tool_call, after_tool_call,
+  // …) to the handlers registerOffload() produced; `engine` is the
+  // OffloadContextEngine captured from registerContextEngine().
+  let offloadRuntime = null;
+  /** in-flight tool calls per session (name/params/timing for tool/result). */
+  const offloadToolCalls = new Map();
+  /** Call one upstream offload hook. Errors never propagate into dsh. */
+  function offloadDispatch(hookName, event, session) {
+    const rt = offloadRuntime;
+    const handler = rt?.hooks?.get(hookName);
+    if (!handler) return;
+    void (async () => {
+      try {
+        await handler(event, { sessionKey: session.id, sessionId: session.id });
+      } catch (error) {
+        ctx.logger.warn(`[tdai-memory] offload ${hookName} failed: ${String(error)}`);
+      }
+    })();
+  }
 
   // One-shot mode (dsh --profile headless): the process exits right after
   // flush, so L1 must finish inside the flush listener. In web mode the
@@ -247,8 +292,91 @@ function apply(ctx, config) {
     core = nextCore;
     recallCache.clear();
     await nextCore.initialize();
+    // Context offload is rebuilt together with the core; a disabled or
+    // misconfigured runtime just leaves offloadRuntime null (all no-ops).
+    if (cfg.offload?.enabled) {
+      setupOffload(cfg, nextConfig);
+    } else {
+      offloadRuntime = null;
+    }
     const key = nextConfig.llm.apiKey || "";
     log("info", `initialized (dataDir=${dataDir}, llm=${nextConfig.llm.model}, apiKey=${key ? "<set>" : "<empty>"}, embedding=${nextConfig.embedding.model})`);
+  }
+
+  // ── context offload (Mermaid short-term memory) ───────────────────────────
+  // Wires upstream `src/offload` (vendor/tdai/offload) into dsh: tool/call +
+  // tool/result session events feed its tool-pair state, and its MMD
+  // (Mermaid-canvas short-term memory) is assembled on a scratch copy of the
+  // message history and delivered as a prompt context — dsh's own compaction
+  // subsystem stays the sole owner of real session history. See VENDOR.md.
+  function setupOffload(cfg, nextConfig) {
+    offloadRuntime = null;
+    const modelRef = cfg.offload.model || nextConfig.llm.model;
+    const slash = modelRef.indexOf("/");
+    const providerKey = slash > 0 ? modelRef.slice(0, slash) : "tdai-llm";
+    const modelId = slash > 0 ? modelRef.slice(slash + 1) : modelRef;
+    const baseUrl = nextConfig.llm.baseUrl;
+    const apiKey = nextConfig.llm.apiKey;
+    if (!modelId || !baseUrl || !apiKey) {
+      log("warn", "offload enabled but llm.baseUrl/llm.apiKey/llm.model incomplete (upstream needs all three); offload stays disabled");
+      return;
+    }
+    const dataDir = cfg.offload.dataDir || join(os.homedir(), ".memory-tencentdb", "context-offload");
+    const hooks = new Map();
+    let engine = null;
+    const contextWindow = cfg.offload.contextWindow;
+    registerOffload({
+      logger,
+      registrationMode: "dsh-shim",
+      config: {
+        agents: { defaults: { model: `${providerKey}/${modelId}` } },
+        models: {
+          providers: {
+            [providerKey]: {
+              baseUrl,
+              apiKey,
+              models: [{ id: modelId, contextWindow }],
+            },
+          },
+        },
+        // Upstream offload only activates when its context-engine slot is
+        // configured to the id it registers (CE_PLUGIN_ID = "memory-tencentdb");
+        // anything else makes every offload hook a no-op upstream.
+        plugins: { slots: { contextEngine: "memory-tencentdb" } },
+      },
+      on: (hookName, handler) => {
+        // Last registration wins: registerOffload may run again on rebuild.
+        hooks.set(hookName, handler);
+      },
+      registerContextEngine: (_id, factoryOrInstance) => {
+        try {
+          engine = typeof factoryOrInstance === "function" ? factoryOrInstance() : factoryOrInstance;
+          return { ok: true };
+        } catch (error) {
+          log("warn", `offload context engine factory failed: ${String(error)}`);
+          return { ok: false, error: String(error) };
+        }
+      },
+    }, {
+      enabled: true,
+      mode: "local",
+      model: `${providerKey}/${modelId}`,
+      dataDir,
+      userId: "dsh-user",
+      temperature: cfg.offload.temperature,
+      forceTriggerThreshold: cfg.offload.forceTriggerThreshold,
+      defaultContextWindow: contextWindow,
+      maxPairsPerBatch: cfg.offload.maxPairsPerBatch,
+      mmdMaxTokenRatio: cfg.offload.mmdMaxTokenRatio,
+      // L3 history compression is off on purpose: dsh's compaction subsystem
+      // owns session history, and offload L3 would rewrite a scratch copy
+      // whose compressed form is discarded. Ratios above 1 never trigger.
+      mildOffloadRatio: 99,
+      aggressiveCompressRatio: 99,
+      backendTimeoutMs: nextConfig.llm.timeoutMs,
+    });
+    offloadRuntime = { engine, hooks, contextWindow };
+    log("info", `offload registered (model=${providerKey}/${modelId}, dataDir=${dataDir}, engine=${engine ? "captured" : "MISSING"})`);
   }
 
   // ── capture: triggered on session/flush (awaitable; runs before process
@@ -260,6 +388,31 @@ function apply(ctx, config) {
     } else if (event.type === "turn/end") {
       lastTurnEnd.set(session.id, event.data.turn);
       trim(lastTurnEnd);
+    } else if (event.type === "tool/call") {
+      // Feed upstream offload's before_tool_call hook (param cache for the
+      // tool pair recorded on tool/result).
+      offloadToolCalls.set(`${session.id}\u0000${event.data.callId}`, {
+        name: event.data.name,
+        params: safeJson(event.data.arguments),
+        at: Date.now(),
+      });
+      trim(offloadToolCalls);
+      offloadDispatch("before_tool_call", {
+        toolCallId: event.data.callId,
+        params: safeJson(event.data.arguments),
+      }, session);
+    } else if (event.type === "tool/result") {
+      // Name/params come from the matching tool/call bookkeeping when still
+      // cached (buildToolPairEvent degrades gracefully without it).
+      const message = event.data?.message ?? {};
+      const callId = message.toolCallId ?? message.source?.callId;
+      offloadDispatch("after_tool_call", {
+        ...buildToolPairEvent({
+          cached: callId ? offloadToolCalls.get(`${session.id}\u0000${callId}`) : undefined,
+          data: event.data,
+        }),
+        messages: mapForOffload(session.deriveMessages()),
+      }, session);
     }
   });
 
@@ -278,6 +431,9 @@ function apply(ctx, config) {
         await core?.handleSessionEnd(session.id).catch((error) => {
           ctx.logger.warn(`[tdai-memory] L1 flush failed: ${String(error)}`);
         });
+        // Offload's own end-of-turn flush (upstream afterTurn flushes
+        // fire-and-forget, so one-shot runs may lose its last L1 batch).
+        await offloadRuntime?.engine?.afterTurn?.({ sessionKey: session.id, sessionId: session.id })?.catch?.(() => {});
       }
     } catch (error) {
       ctx.logger.warn(`[tdai-memory] capture failed: ${String(error)}`);
@@ -328,6 +484,14 @@ function apply(ctx, config) {
   // listeners never see agent-scoped assemblies. Agents appear right after
   // their session is announced, so defer one tick and attach there.
   ctx.on("session/created", (session) => {
+    // Warm the offload per-session state manager (resolves + attaches it for
+    // the later hook calls and engine.assemble()).
+    const engine0 = offloadRuntime?.engine;
+    if (engine0?.bootstrap) {
+      void Promise.resolve(engine0.bootstrap({ sessionKey: session.id, sessionId: session.id })).catch((error) => {
+        ctx.logger.warn(`[tdai-memory] offload bootstrap failed: ${String(error)}`);
+      });
+    }
     setTimeout(() => {
       try {
         const agents = ctx.get("agents");
@@ -335,21 +499,39 @@ function apply(ctx, config) {
         if (!agent?.ctx) return;
         agent.ctx.on("system-prompt/assemble", async (assembly, context) => {
           try {
-            if (!tdaiConfig?.recall.enabled) return assembly;
             const lastUser = [...session.deriveMessages()].reverse().find(isRealUserMessage);
-            if (!lastUser) return assembly;
-            const text = extractText(lastUser.content);
-            if (!text) return assembly;
-            const cached = recallCache.get(session.id, text);
-            if (cached !== undefined) {
-              return injectRecall(assembly, cached);
+            const text = lastUser ? extractText(lastUser.content) : "";
+            let result = assembly;
+
+            // ── long-term recall (tdai:recall / tdai:profile contexts) ──────
+            if (tdaiConfig?.recall.enabled && text) {
+              try {
+                const cached = recallCache.get(session.id, text);
+                let recallResult = cached;
+                if (cached === undefined) {
+                  const recallCore = core;
+                  recallResult = await recallWithTimeout(
+                    () => recallCore.handleBeforeRecall(text, session.id), tdaiConfig.recall.timeoutMs + 1000,
+                  );
+                  if (core === recallCore) recallCache.set(session.id, text, recallResult);
+                }
+                result = injectRecall(result, recallResult ?? {});
+              } catch (error) {
+                ctx.logger.warn(`[tdai-memory] recall failed: ${String(error)}`);
+              }
             }
-            const recallCore = core;
-            const result = await recallWithTimeout(
-              () => recallCore.handleBeforeRecall(text, session.id), tdaiConfig.recall.timeoutMs + 1000,
-            );
-            if (core === recallCore) recallCache.set(session.id, text, result);
-            return injectRecall(assembly, result ?? {});
+
+            // ── context offload MMD (tdai:mmd context) ─────────────────────
+            // Assembled on a scratch copy of the history — dsh's compaction
+            // subsystem stays the sole owner of real session history.
+            const mmdText = await offloadMmdContext(session, text);
+            if (mmdText) {
+              result = {
+                ...result,
+                contexts: [...(result.contexts ?? []), { name: "tdai:mmd", order: 1002, text: mmdText }],
+              };
+            }
+            return result;
           } catch (error) {
             ctx.logger.warn(`[tdai-memory] recall failed: ${String(error)}`);
             return assembly;
@@ -366,7 +548,35 @@ function apply(ctx, config) {
     if (result.prependContext) extras.push({ name: "tdai:recall", order: 1000, text: result.prependContext });
     if (result.appendSystemContext) extras.push({ name: "tdai:profile", order: 1001, text: result.appendSystemContext });
     if (extras.length === 0) return assembly;
-    return { ...assembly, contexts: [...assembly.contexts, ...extras] };
+    return { ...assembly, contexts: [...(assembly.contexts ?? []), ...extras] };
+  }
+
+  /**
+   * Assemble upstream context-offload MMD (Mermaid short-term memory) on a
+   * SCRATCH copy of the message history and return it as prompt text (null
+   * when nothing to inject / offload disabled). The output messages carry
+   * the injected MMD message flagged `m._mmdContextMessage`; dsh's real
+   * history is never mutated. Calling assemble() per prompt assembly is also
+   * what settles upstream's L1.5 stage for hosts without a context-engine
+   * lifecycle (upstream note in offload/index.ts).
+   */
+  async function offloadMmdContext(session, prompt) {
+    const rt = offloadRuntime;
+    const engine = rt?.engine;
+    if (!engine?.assemble || !prompt) return null;
+    try {
+      const result = await engine.assemble({
+        messages: mapForOffload(session.deriveMessages()),
+        tokenBudget: rt.contextWindow,
+        prompt,
+        sessionKey: session.id,
+        sessionId: session.id,
+      });
+      return extractMmdText(result?.messages) || null;
+    } catch (error) {
+      ctx.logger.warn(`[tdai-memory] offload MMD assembly failed: ${String(error)}`);
+      return null;
+    }
   }
 
   // ── tools ────────────────────────────────────────────────────────────────

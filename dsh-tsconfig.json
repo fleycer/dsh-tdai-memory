@@ -16,6 +16,15 @@
     "src/config.ts",
     "src/core/**/*.ts",
     "src/utils/**/*.ts",
+    "src/services/**/*.ts",
+    "src/offload/**/*.ts",
+    "src/offload-client/**/*.ts",
     "src/adapters/standalone/**/*.ts"
+  ],
+  "exclude": [
+    "src/**/__tests__/**",
+    "src/**/*.test.ts",
+    "src/**/*.spec.ts",
+    "src/offload/benchmark-token-estimate.ts"
   ]
 }

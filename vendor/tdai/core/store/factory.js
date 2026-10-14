@@ -5,6 +5,10 @@
  * Supports:
  * - "sqlite" (default): local SQLite + sqlite-vec + FTS5
  * - "tcvdb": Tencent Cloud VectorDB (server-side embedding + hybridSearch)
+ *
+ * Both backends ship with core — TCVDB is a vendor-provided store that has
+ * always been part of the open-source surface of this plugin (matches the
+ * historical behavior prior to the open-source repackaging).
  */
 import path from "node:path";
 import { VectorStore } from "./sqlite.js";

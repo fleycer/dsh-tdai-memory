@@ -23,9 +23,8 @@
  * the same lock, so callers can freely `new CheckpointManager()` without coordination.
  * Writes use atomic tmp+rename to prevent corruption on crash.
  */
-import fs from "node:fs/promises";
-import path from "node:path";
 import { randomBytes } from "node:crypto";
+import { StoragePaths } from "../core/storage/types.js";
 const DEFAULT_RUNNER_STATE = {
     last_captured_timestamp: 0,
     last_l1_cursor: 0,
@@ -87,8 +86,16 @@ async function withFileLock(filePath, fn) {
 export class CheckpointManager {
     filePath;
     logger;
-    constructor(dataDir, logger) {
-        this.filePath = path.join(dataDir, ".metadata", "recall_checkpoint.json");
+    storage;
+    constructor(dataDir, logger, storage) {
+        this.storage = storage;
+        if (storage) {
+            this.filePath = StoragePaths.checkpoint;
+        }
+        else {
+            // Dynamic import path for fs-based mode is resolved in readRaw/writeRaw
+            this.filePath = `${dataDir}/.metadata/recall_checkpoint.json`;
+        }
         this.logger = logger ?? noopLogger;
     }
     // ============================
@@ -96,7 +103,16 @@ export class CheckpointManager {
     // ============================
     async readRaw() {
         try {
-            const raw = await fs.readFile(this.filePath, "utf-8");
+            let raw;
+            if (this.storage) {
+                raw = await this.storage.readFile(this.filePath);
+            }
+            else {
+                const fs = await import("node:fs/promises");
+                raw = await fs.default.readFile(this.filePath, "utf-8");
+            }
+            if (!raw)
+                return structuredClone(DEFAULT_CHECKPOINT);
             const parsed = JSON.parse(raw);
             // Merge with defaults for backward compat (old checkpoints lack new fields).
             // structuredClone avoids shallow-copy pitfall: without it, the nested
@@ -145,13 +161,21 @@ export class CheckpointManager {
             return structuredClone(DEFAULT_CHECKPOINT);
         }
     }
-    /** Atomic write: write to tmp file, then rename into place. */
+    /** Atomic write: write to tmp file, then rename into place (fs mode). Storage mode: direct overwrite. */
     async writeRaw(checkpoint) {
-        const dir = path.dirname(this.filePath);
-        await fs.mkdir(dir, { recursive: true });
-        const tmp = `${this.filePath}.tmp.${randomBytes(4).toString("hex")}`;
-        await fs.writeFile(tmp, JSON.stringify(checkpoint, null, 2), "utf-8");
-        await fs.rename(tmp, this.filePath);
+        const content = JSON.stringify(checkpoint, null, 2);
+        if (this.storage) {
+            await this.storage.writeFile(this.filePath, content);
+        }
+        else {
+            const fs = await import("node:fs/promises");
+            const path = await import("node:path");
+            const dir = path.default.dirname(this.filePath);
+            await fs.default.mkdir(dir, { recursive: true });
+            const tmp = `${this.filePath}.tmp.${randomBytes(4).toString("hex")}`;
+            await fs.default.writeFile(tmp, content, "utf-8");
+            await fs.default.rename(tmp, this.filePath);
+        }
     }
     // ============================
     // Locked read-modify-write helper
@@ -338,12 +362,8 @@ export class CheckpointManager {
             const state = this.getRunnerState(cp, sessionKey);
             let afterTimestamp = state.last_captured_timestamp || 0;
             // Cold-start guard (same logic that was previously in auto-capture.ts)
-            // Subtract 1ms from the plugin-start floor: the very first turn may be
-            // flushed in the same millisecond the plugin started, and the L0 filter
-            // is strict `timestamp > cursor` — an identical timestamp would drop
-            // the first turn entirely.
             if (afterTimestamp === 0 && pluginStartTimestamp && pluginStartTimestamp > 0) {
-                afterTimestamp = pluginStartTimestamp - 1;
+                afterTimestamp = pluginStartTimestamp;
             }
             const result = await fn(afterTimestamp);
             if (result) {

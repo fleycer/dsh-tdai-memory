@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.0 (vendor sync + context offload)
+
+- **Vendored upstream core synced to
+  `@tencentdb-agent-memory/memory-tencentdb@1.0.3`** (143 compiled files):
+  the previously missing `core/quota`, `core/state`, `core/storage`,
+  `services/**` and the whole `offload/` module are now vendored — see
+  [VENDOR.md](VENDOR.md) for the build procedure and the upstream's
+  non-type-clean build notes. New runtime deps: `crc-32`, `js-tiktoken`.
+- **Context offload ported (opt-in, `offload.enabled`, off by default)**:
+  upstream Mermaid short-term memory (the −61% context-token feature) is
+  wired into DSH — `tool/call`/`tool/result` events feed the upstream
+  `before_tool_call`/`after_tool_call` hooks, and `engine.assemble()` runs
+  per prompt assembly on a mapped **scratch copy** of the history; the
+  resulting MMD is delivered as the `tdai:mmd` prompt context (ordered after
+  `tdai:recall`/`tdai:profile`). Real session history is never touched —
+  DSH's compaction subsystem stays its sole owner.
+- **L3 history compression stays disabled by design** (`mildOffloadRatio`/
+  `aggressiveCompressRatio` above any trigger): DSH compaction owns history;
+  offload L1.5/L2 and tool-pair entries still feed the memory graph.
+- Local offload mode speaks any OpenAI-compatible endpoint through `llm.*`
+  (or `offload.model`); incomplete LLM settings disable offload with a
+  warning instead of half-wiring it.
+- Pure offload helpers live in `offload-runtime.js` (testable without booting
+  the plugin). New tests: `tests/offload-runtime.test.mjs` (8 unit tests),
+  `tests/offload-wiring.test.mjs` (8 static wiring contracts + 2 behavioural
+  against the real schema and the assembly listener).
+
 ## 0.5.0 (fork hardening)
 
 Fork maintenance release: no intentional behaviour change except the explicit

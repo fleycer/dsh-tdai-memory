@@ -406,10 +406,10 @@ export class TcvdbMemoryStore {
             await this._ensureInit();
             if (this.degraded)
                 return false;
-            await this.client.deleteDoc(this.l1Collection, {
+            const affected = await this.client.deleteDoc(this.l1Collection, {
                 query: { documentIds: [recordId] },
             });
-            return true;
+            return affected > 0;
         }
         catch (err) {
             this.logger?.warn(`${TAG} [L1-delete] FAILED id=${recordId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -481,7 +481,7 @@ export class TcvdbMemoryStore {
             await this._ensureInit();
             if (this.degraded)
                 return [];
-            // Build TCVDB filter expression from L1QueryFilter
+            // Build filter expression
             const conditions = [];
             if (filter?.sessionKey)
                 conditions.push(`session_key = "${filter.sessionKey}"`);
@@ -493,6 +493,34 @@ export class TcvdbMemoryStore {
                     conditions.push(`updated_time_ms > ${afterMs}`);
             }
             const filterExpr = conditions.length > 0 ? conditions.join(" and ") : undefined;
+            // Primary key lookup: use documentIds (fast, no full scan)
+            if (filter?.recordIds && filter.recordIds.length > 0) {
+                const queryParams = {
+                    retrieveVector: false,
+                    documentIds: filter.recordIds,
+                    outputFields: L1_OUTPUT_FIELDS,
+                };
+                if (filterExpr)
+                    queryParams.filter = filterExpr;
+                const resp = await this.client.query(this.l1Collection, queryParams);
+                const docs = resp.documents ?? [];
+                return docs.map((doc) => ({
+                    record_id: String(doc.id ?? ""),
+                    content: String(doc.text ?? ""),
+                    type: String(doc.type ?? ""),
+                    priority: Number(doc.priority ?? 0),
+                    scene_name: String(doc.scene_name ?? ""),
+                    session_key: String(doc.session_key ?? ""),
+                    session_id: String(doc.session_id ?? ""),
+                    timestamp_str: String(doc.timestamp_str ?? ""),
+                    timestamp_start: String(doc.timestamp_start ?? ""),
+                    timestamp_end: String(doc.timestamp_end ?? ""),
+                    created_time: epochMsToIso(Number(doc.created_time_ms ?? 0)),
+                    updated_time: epochMsToIso(Number(doc.updated_time_ms ?? 0)),
+                    metadata_json: String(doc.metadata_json ?? "{}"),
+                }));
+            }
+            // Full scan with optional filter
             const docs = await this._queryAllDocs(this.l1Collection, filterExpr, L1_OUTPUT_FIELDS, undefined, // no limit — fetch all matching
             [{ fieldName: "updated_time_ms", direction: "asc" }]);
             return docs.map((doc) => ({
@@ -694,10 +722,10 @@ export class TcvdbMemoryStore {
             await this._ensureInit();
             if (this.degraded)
                 return false;
-            await this.client.deleteDoc(this.l0Collection, {
+            const affected = await this.client.deleteDoc(this.l0Collection, {
                 query: { documentIds: [recordId] },
             });
-            return true;
+            return affected > 0;
         }
         catch (err) {
             this.logger?.warn(`${TAG} [L0-delete] FAILED: ${err instanceof Error ? err.message : String(err)}`);
@@ -757,8 +785,10 @@ export class TcvdbMemoryStore {
                 conditions.push(`recorded_at_ms > ${afterRecordedAtMs}`);
             }
             const filterExpr = conditions.join(" and ");
-            const docs = await this._queryAllDocs(this.l0Collection, filterExpr, L0_OUTPUT_FIELDS, limit, [{ fieldName: "recorded_at_ms", direction: "desc" }]);
-            // Convert to L0QueryRow and reverse to chronological order (query is DESC, callers expect ASC)
+            // Query oldest-first (ASC) — preserves backlog ordering so callers that
+            // advance a recorded_at cursor never skip older rows. See sqlite.ts
+            // queryL0ForL1 for the full rationale.
+            const docs = await this._queryAllDocs(this.l0Collection, filterExpr, L0_OUTPUT_FIELDS, limit, [{ fieldName: "recorded_at_ms", direction: "asc" }]);
             const rows = docs.map((doc) => ({
                 record_id: String(doc.id ?? ""),
                 session_key: String(doc.session_key ?? ""),
@@ -768,7 +798,7 @@ export class TcvdbMemoryStore {
                 recorded_at: epochMsToIso(Number(doc.recorded_at_ms ?? 0)),
                 timestamp: Number(doc.timestamp ?? 0),
             }));
-            return rows.reverse();
+            return rows;
         }
         catch (err) {
             this.logger?.warn(`${TAG} [L0-queryForL1] FAILED: ${err instanceof Error ? err.message : String(err)}`);
@@ -840,6 +870,12 @@ export class TcvdbMemoryStore {
             return [];
         // Use hybrid search; L0SearchResult and L0FtsResult have identical shapes
         return this.searchL0HybridAsync({ queryText: ftsQuery, topK: limit });
+    }
+    async searchL0Hybrid(params) {
+        const queryText = params.query;
+        if (!queryText)
+            return [];
+        return this.searchL0HybridAsync({ queryText, topK: params.topK });
     }
     /**
      * Async L0 hybrid search.
@@ -1003,6 +1039,119 @@ export class TcvdbMemoryStore {
     }
     isFtsAvailable() {
         return !!this.bm25Encoder;
+    }
+    // ── v2 API: Paginated queries ─────────────────────────────
+    async queryL0Paginated(filter) {
+        await this._ensureInit();
+        if (this.degraded)
+            return { rows: [], total: 0 };
+        try {
+            const conditions = [];
+            if (filter.sessionId) {
+                conditions.push(`(session_key = "${filter.sessionId}" or session_id = "${filter.sessionId}")`);
+            }
+            if (filter.timeStartMs !== undefined) {
+                conditions.push(`recorded_at_ms >= ${filter.timeStartMs}`);
+            }
+            if (filter.timeEndMs !== undefined) {
+                conditions.push(`recorded_at_ms <= ${filter.timeEndMs}`);
+            }
+            const filterExpr = conditions.length > 0 ? conditions.join(" and ") : undefined;
+            // Get total count
+            const total = await this.client.count(this.l0Collection, filterExpr);
+            // Get page
+            const resp = await this.client.query(this.l0Collection, {
+                retrieveVector: false,
+                limit: filter.limit,
+                offset: filter.offset,
+                filter: filterExpr,
+                outputFields: ["id", "session_key", "session_id", "role", "message_text", "recorded_at_ms", "timestamp"],
+                sort: [{ fieldName: "recorded_at_ms", direction: "desc" }],
+            });
+            const docs = resp.documents ?? [];
+            const rows = docs.map((d) => ({
+                record_id: d.id,
+                session_key: d.session_key ?? "",
+                session_id: d.session_id ?? "",
+                role: d.role ?? "",
+                message_text: d.message_text ?? "",
+                recorded_at: d.recorded_at_ms ? new Date(d.recorded_at_ms).toISOString() : "",
+                timestamp: d.timestamp ?? d.recorded_at_ms ?? 0,
+            }));
+            return { rows, total };
+        }
+        catch (err) {
+            this.logger?.warn(`${TAG} [L0-queryPaginated] FAILED: ${err instanceof Error ? err.message : String(err)}`);
+            return { rows: [], total: 0 };
+        }
+    }
+    async queryL1Paginated(filter) {
+        await this._ensureInit();
+        if (this.degraded)
+            return { rows: [], total: 0 };
+        try {
+            const conditions = [];
+            if (filter.type) {
+                conditions.push(`type = "${filter.type}"`);
+            }
+            if (filter.timeStart) {
+                const ms = new Date(filter.timeStart).getTime();
+                conditions.push(`updated_time_ms >= ${ms}`);
+            }
+            if (filter.timeEnd) {
+                const ms = new Date(filter.timeEnd).getTime();
+                conditions.push(`updated_time_ms <= ${ms}`);
+            }
+            const filterExpr = conditions.length > 0 ? conditions.join(" and ") : undefined;
+            // Get total count
+            const total = await this.client.count(this.l1Collection, filterExpr);
+            // Get page
+            const resp = await this.client.query(this.l1Collection, {
+                retrieveVector: false,
+                limit: filter.limit,
+                offset: filter.offset,
+                filter: filterExpr,
+                outputFields: ["id", "text", "type", "priority", "scene_name", "session_key", "session_id", "timestamp_str", "timestamp_start", "timestamp_end", "created_time_ms", "updated_time_ms", "metadata_json"],
+                sort: [{ fieldName: "updated_time_ms", direction: "desc" }],
+            });
+            const docs = resp.documents ?? [];
+            const rows = docs.map((d) => ({
+                record_id: d.id,
+                content: d.text ?? "",
+                type: d.type ?? "",
+                priority: d.priority ?? 50,
+                scene_name: d.scene_name ?? "",
+                session_key: d.session_key ?? "",
+                session_id: d.session_id ?? "",
+                timestamp_str: d.timestamp_str ?? "",
+                timestamp_start: d.timestamp_start ?? "",
+                timestamp_end: d.timestamp_end ?? "",
+                created_time: d.created_time_ms ? new Date(d.created_time_ms).toISOString() : "",
+                updated_time: d.updated_time_ms ? new Date(d.updated_time_ms).toISOString() : "",
+                metadata_json: d.metadata_json ?? "{}",
+            }));
+            return { rows, total };
+        }
+        catch (err) {
+            this.logger?.warn(`${TAG} [L1-queryPaginated] FAILED: ${err instanceof Error ? err.message : String(err)}`);
+            return { rows: [], total: 0 };
+        }
+    }
+    async deleteL0BySession(sessionId) {
+        await this._ensureInit();
+        if (this.degraded)
+            return 0;
+        try {
+            const filterExpr = `(session_key = "${sessionId}" or session_id = "${sessionId}")`;
+            const affected = await this.client.deleteDoc(this.l0Collection, {
+                query: { filter: filterExpr },
+            });
+            return affected;
+        }
+        catch (err) {
+            this.logger?.warn(`[tcvdb] deleteL0BySession failed: ${err instanceof Error ? err.message : String(err)}`);
+            return 0;
+        }
     }
     // ── Internal: parse search results ───────────────────────
     _parseL1SearchResults(docArrays) {

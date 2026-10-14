@@ -427,10 +427,11 @@ export class MemoryPipelineManager {
     onL1IdleTimeout(sessionKey) {
         const buffer = this.messageBuffers.get(sessionKey);
         const state = this.sessionStates.get(sessionKey);
-        if ((!buffer || buffer.length === 0) && (!state || state.conversation_count === 0)) {
-            this.logger?.debug?.(`${TAG} [${sessionKey}] L1 idle timeout but no pending messages or conversations`);
-            return;
-        }
+        // We deliberately do NOT early-return when in-memory buffer/conversation_count
+        // are both zero. The runner now over-fetches L0 from the DB, so a "small tail"
+        // backlog (see runL1's hasMore branch) may have re-armed this idle timer with
+        // nothing in memory but rows past the cursor in the DB.  enqueueL1 →
+        // runL1 → runner will detect "no rows past cursor" and early-return cheaply.
         this.logger?.debug?.(`${TAG} [${sessionKey}] L1 idle timeout fired (buffered=${buffer?.length ?? 0}, conversations=${state?.conversation_count ?? 0})`);
         this.enqueueL1(sessionKey, "idle_timeout");
     }
@@ -485,10 +486,12 @@ export class MemoryPipelineManager {
         // Drain the message buffer (take ownership, clear the shared ref)
         const buffer = this.messageBuffers.get(sessionKey) ?? [];
         this.messageBuffers.set(sessionKey, []);
-        if (buffer.length === 0 && state.conversation_count === 0) {
-            this.logger?.debug?.(`${TAG} [${sessionKey}] L1 skipped: no messages and no pending conversations`);
-            return;
-        }
+        // NOTE: we no longer early-return when buffer + conversation_count are both
+        // zero. The runner is now the source of truth for "is there work to do?":
+        // it queries L0 from the DB via the cursor, so an idle-timeout-triggered
+        // run with empty in-memory state is still meaningful — it will pick up any
+        // backlog past `last_l1_cursor` (see runL1's hasMore branch). The runner
+        // itself cheaply early-returns when the DB query returns 0 rows.
         this.logger?.debug?.(`${TAG} [${sessionKey}] L1 running: messages=${buffer.length}, conversation_count=${state.conversation_count}`);
         if (!this.l1Runner) {
             this.logger?.warn(`${TAG} [${sessionKey}] No L1 runner set, skipping`);
@@ -499,8 +502,9 @@ export class MemoryPipelineManager {
             this.advanceL2Timer(sessionKey);
             return;
         }
+        let runnerResult;
         try {
-            await this.l1Runner({
+            runnerResult = await this.l1Runner({
                 sessionKey,
                 msg: buffer,
                 bg_msg: [], // reserved for future use
@@ -537,6 +541,26 @@ export class MemoryPipelineManager {
         await this.persistStates();
         // Advance the L2 timer (downward-only) to fire after delay, respecting minInterval
         this.advanceL2Timer(sessionKey);
+        // ── L0 backlog drain ──────────────────────────────────
+        //
+        // The runner over-fetches (queries 2N rows but processes at most N) so
+        // backlog state is detectable from the runner's return value.
+        //   - hasFullBacklog → DB likely has many more rows past the cursor; drain
+        //     immediately by enqueueing another L1 round on the shared queue.
+        //   - hasMore (small tail, <2N) → defer to the existing l1Idle timer so
+        //     the residual rows are picked up either when the user pauses or on
+        //     the next conversation. Reuses the same idle handler — no special
+        //     drain semantics, just a normal idle re-trigger.
+        if (runnerResult && typeof runnerResult === "object") {
+            if (runnerResult.hasFullBacklog) {
+                this.logger?.debug?.(`${TAG} [${sessionKey}] L0 backlog detected (full batch) — enqueueing next L1 round`);
+                this.enqueueL1(sessionKey, "idle_timeout");
+            }
+            else if (runnerResult.hasMore) {
+                this.logger?.debug?.(`${TAG} [${sessionKey}] L0 backlog detected (small tail) — arming L1 idle timer (${this.l1IdleTimeoutMs / 1000}s)`);
+                timers.l1Idle.schedule(this.l1IdleTimeoutMs, () => this.onL1IdleTimeout(sessionKey));
+            }
+        }
     }
     // ============================
     // Internal: L2 timer management (downward-only)
@@ -677,12 +701,6 @@ export class MemoryPipelineManager {
         // Advance cursor using the record timestamp returned by the runner
         if (result?.latestCursor) {
             state.last_extraction_updated_time = result.latestCursor;
-        }
-        else if (!state.last_extraction_updated_time) {
-            // Cold-start guard: if runner returned void (e.g. extraction failure) and
-            // last_extraction_updated_time is still empty, initialize it to now so
-            // the next L2 run doesn't do a full table scan.
-            state.last_extraction_updated_time = new Date().toISOString();
         }
         await this.persistStates();
         this.logger?.debug?.(`${TAG} [${sessionKey}] L2 complete`);

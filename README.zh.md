@@ -16,7 +16,7 @@
 
 把 **TencentDB Agent Memory**（腾讯云开源的四层记忆系统，原为 OpenClaw 插件）移植进 DeepSeek Harness。
 
-## 兼容性（v0.5.0）
+## 兼容性（v0.6.0）
 
 本版本要求 DSH `0.2.0-rc.2` 或更新的 `0.2.x` 宿主（manifest 中的
 `dsh.compatibility.dsh` 范围），已在 DSH `0.2.0-rc.2` 的独立 Profile 验证。
@@ -44,8 +44,41 @@ dsh plugin --profile desktop add dsh-tdai-memory
 - **L2 场景 / L3 画像**：场景块与用户画像生成（管线自动调度）
 - **自动召回注入**：每次组装提示词时，按当前用户消息检索相关记忆 + 画像，作为动态上下文注入（模型"凭空想起"）
 - **工具**：`tdai_memory_search`（L1 结构化检索）、`tdai_conversation_search`（L0 原文检索）
+- **上下文卸载（可选开启）**：每会话的 Mermaid 画布式短期记忆（上游 −61% 上下文 token 特性），以 `tdai:mmd` 提示词上下文注入 —— 见下文专节
 
 数据目录复用现有 `~/.memory-tencentdb/memory-tdai`，**旧记忆无缝继承**。
+
+## 上下文卸载（Mermaid 短期记忆，v0.6.0）
+
+上游 `src/offload` 模块（v0.6.0 起已 vendor）为运行中的会话维护一份符号化
+短期记忆 —— 实体/关系的 Mermaid 画布，节点细节落盘到文件 —— 并以紧凑
+上下文代替原始历史注入。在 profile patch 中开启：
+
+```yaml
+    offload:
+      enabled: true          # 默认关闭
+      model: ''              # 可选 "provider/model-id"；留空 = llm.model
+      dataDir: ''            # 默认 ~/.memory-tencentdb/context-offload
+      temperature: 0.2
+      contextWindow: 200000  # 用于 token 预算的模型上下文窗口
+      mmdMaxTokenRatio: 0.2  # MMD 最多占窗口的 20%
+      forceTriggerThreshold: 4
+      maxPairsPerBatch: 20
+```
+
+任何 OpenAI 兼容端点都可用（与提取共用 `llm.*` 连接，或用 `offload.model`
+分开）。设计要点：
+
+- **只作为提示词上下文注入，绝不改写真实历史。** 上游的危险投影路径
+  （重写会话真实消息）不启用；`engine.assemble()` 在历史的暂存副本上运行，
+  MMD 落在 `tdai:recall`/`tdai:profile` 之后的 `tdai:mmd` 上下文。DSH 的
+  compaction 子系统仍是会话历史的唯一所有者。
+- **L3 历史压缩有意禁用**（配置比率固定在触发阈值之上）：压缩后的暂存
+  副本反正会被丢弃；记忆图的副作用（条目、MMD）改由工具配对、L1.5 与
+  L2 提供。
+- MMD 反映的是**当前轮之前**的所有轮次，因此新会话在首轮处理前画布为空。
+- headless 一次性运行会在 `session/flush` 内冲刷最后一轮 offload；上游
+  自身的冲刷是 fire-and-forget，进程级强杀可能丢失其最后一批。
 
 `node-llama-cpp` 仅供完全本地的 embedding 后端使用，现在声明为可选 peer，默认安装不会再触发原生构建脚本。使用 OpenAI 兼容远程 embedding 时不需要它；选择本地后端的用户需在目标 DSH profile 中单独安装并批准 `node-llama-cpp` 的构建。
 
@@ -58,7 +91,7 @@ L1 提取需要显式配置 `llm.model`（或 `TDAI_LLM_MODEL`）。未配置时
 |---|---|
 | 核心 | `tdai-memory-openclaw-plugin` 的 host-neutral 核心（`src/core`、`src/utils`），tsc 编译为 ESM（`vendor/tdai/`），零改动（上游版本与重建步骤见 [VENDOR.md](VENDOR.md)） |
 | 宿主适配 | `StandaloneHostAdapter`（官方 standalone 模式，OpenAI 兼容直调） |
-| dsh 壳 | `index.js`：配置映射、`session/event`+`session/flush` 捕获、`agent.ctx` 上的 `system-prompt/assemble` waterfall 召回注入、工具注册、生命周期 |
+| dsh 壳 | `index.js`：配置映射、`session/event`+`session/flush` 捕获、`agent.ctx` 上的 `system-prompt/assemble` waterfall 召回注入、上下文卸载接线（`offload-runtime.js`）、工具注册、生命周期 |
 | 备用 | `recall-inject.js`：preset 行形态的召回注入（挂在 agent preset 内时用） |
 
 召回缓存默认 30 秒过期，每个注入实例最多保留 128 个会话。失败或超时的召回
@@ -111,7 +144,7 @@ tdai-memory:
 - **dedup**：LLM 冲突检测输出解析不稳（曾导致 stored=0），默认关闭；开启需换更稳的模型
 - **L1 记忆向量**：随存储写入（8088 embedding 快）；L0 向量走后台任务，headless 退出时由 `destroy()` drain
 - **搜索工具**（`toolsEnabled`，默认开启）：开关在插件页，切换后**原地生效**（行配置是 `volatile`，无需重启即重新注册）。若两个工具完全缺失，可查插件日志 `[tdai-memory] tools registered: …`（v0.4.1 起）；v0.4.1 之前它读的是 cordis 交给 `apply` 的 Volatile 包装对象上的 `config.toolsEnabled` —— 那个属性永远不存在，因此整个失败过程完全静默（issue #3）
-- **升级**：`vendor/tdai/` 是上游核心的冻结编译快照；上游版本、已知差距（offload / Mermaid 短期记忆压缩尚未移植）与重建步骤见 [VENDOR.md](VENDOR.md)
+- **升级**：`vendor/tdai/` 是上游核心的冻结编译快照，v0.6.0 起同步至 `@tencentdb-agent-memory/memory-tencentdb@1.0.3`；上游版本、重建步骤与 offload 接线契约见 [VENDOR.md](VENDOR.md)
 
 
 保存使用配置表单 API；宿主拒绝写入时保留草稿并提示错误。只修改模型不会覆盖密钥，关闭默认开启的选项会显式保存 `false`。

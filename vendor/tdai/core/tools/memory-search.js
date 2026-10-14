@@ -75,7 +75,36 @@ export async function executeMemorySearch(params) {
     }
     // ── Over-retrieve for later filtering and RRF merging ──
     const candidateK = limit * 3;
-    // ── Run available search strategies in parallel ──
+    // ── Native hybrid short-circuit (TCVDB) ──
+    // If the store natively supports hybrid search (dense + sparse + RRF in a
+    // single API call), skip the dual-path FTS+Vector logic to avoid a redundant
+    // second HTTP request with garbled FTS tokens as embedding input.
+    if (vectorStore.getCapabilities().nativeHybridSearch && vectorStore.searchL1Hybrid) {
+        logger?.debug?.(`${TAG} [native-hybrid] Single-call hybrid search...`);
+        const results = await vectorStore.searchL1Hybrid({ query, topK: candidateK });
+        let items = results.map((r) => ({
+            id: r.record_id,
+            content: r.content,
+            type: r.type,
+            priority: r.priority,
+            scene_name: r.scene_name,
+            score: r.score,
+            created_at: r.timestamp_start,
+            updated_at: r.timestamp_end,
+        }));
+        // Apply secondary filters
+        if (typeFilter)
+            items = items.filter((r) => r.type === typeFilter);
+        if (sceneFilter) {
+            const ns = sceneFilter.toLowerCase();
+            items = items.filter((r) => r.scene_name.toLowerCase().includes(ns));
+        }
+        const trimmed = items.slice(0, limit);
+        logger?.debug?.(`${TAG} RESULT (strategy=native-hybrid): returning ${trimmed.length} memories ` +
+            `(scores: [${trimmed.map((r) => r.score.toFixed(3)).join(", ")}])`);
+        return { results: trimmed, total: trimmed.length, strategy: "hybrid" };
+    }
+    // ── SQLite dual-path: run FTS5 + Vector in parallel, merge with client-side RRF ──
     const [ftsItems, vecItems] = await Promise.all([
         // FTS5 keyword search
         (async () => {

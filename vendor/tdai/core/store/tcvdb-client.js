@@ -192,11 +192,12 @@ export class TcvdbClient {
         });
     }
     async deleteDoc(collection, params) {
-        await this.request("/document/delete", {
+        const resp = await this.request("/document/delete", {
             database: this.database,
             collection,
             ...params,
         });
+        return resp.affectedCount ?? 0;
     }
     /**
      * Count documents matching an optional filter.

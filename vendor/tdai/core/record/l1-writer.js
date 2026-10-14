@@ -15,10 +15,8 @@
  * v3: Aligned with Kenty's prompt output format — 3 memory types (persona/episodic/instruction),
  * numeric priority, scene_name, source_message_ids, metadata, timestamps.
  */
-import fs from "node:fs/promises";
-import path from "node:path";
 import crypto from "node:crypto";
-import { formatLocalDate } from "../../utils/time.js";
+import { StoragePaths } from "../storage/types.js";
 const TAG = "[memory-tdai][l1-writer]";
 // ============================
 // Core functions
@@ -41,7 +39,7 @@ export function generateMemoryId() {
  * v3.1: optional VectorStore + EmbeddingService for dual-write (JSONL + vector).
  */
 export async function writeMemory(params) {
-    const { memory, decision, baseDir, sessionKey, sessionId, logger, vectorStore, embeddingService } = params;
+    const { memory, decision, baseDir, sessionKey, sessionId, logger, vectorStore, embeddingService, storage } = params;
     if (decision.action === "skip") {
         logger?.debug?.(`${TAG} Skipping memory: ${memory.content.slice(0, 50)}...`);
         return null;
@@ -79,10 +77,34 @@ export async function writeMemory(params) {
         sessionKey,
         sessionId: sessionId || "",
     };
-    const recordsDir = path.join(baseDir, "records");
-    await fs.mkdir(recordsDir, { recursive: true });
     const shardDate = formatLocalDate(new Date());
-    const filePath = path.join(recordsDir, `${shardDate}.jsonl`);
+    const recordKey = StoragePaths.record(shardDate);
+    // Helper: append a JSONL line
+    // - standalone (no storage): write to local fs
+    // - service (storage provided): write via StorageAdapter, no fs fallback
+    //
+    // Guard log (CR-2 fix, 2026-05-19): if storage is absent, emit a warn so any
+    // missed wiring (e.g. caller forgot to pass storage in service mode) is
+    // immediately visible instead of silently writing to ephemeral pod fs.
+    // In standalone mode this warn is benign — the gateway auto-wires a
+    // LocalStorageBackend at startup (server.ts:199-203), so storage should
+    // normally be defined. Seeing this warn = caller forgot to pass it.
+    const appendRecord = async (line) => {
+        if (storage) {
+            await storage.appendFile(recordKey, line);
+        }
+        else {
+            logger?.warn?.(`${TAG} [CR-2 guard] writeMemory called without storage adapter; ` +
+                `falling back to local fs at ${baseDir}/records/${shardDate}.jsonl. ` +
+                `In service mode this means JSONL is written to ephemeral pod fs and ` +
+                `will be lost on restart. Caller must pass 'storage' to writeMemory.`);
+            const fs = await import("node:fs/promises");
+            const path = await import("node:path");
+            const recordsDir = path.default.join(baseDir, "records");
+            await fs.default.mkdir(recordsDir, { recursive: true });
+            await fs.default.appendFile(path.default.join(recordsDir, `${shardDate}.jsonl`), line, "utf-8");
+        }
+    };
     if ((decision.action === "update" || decision.action === "merge") && decision.target_ids.length > 0) {
         // Remove target records from VectorStore (real-time deletion for retrieval accuracy).
         // JSONL is append-only — old records remain in files and are cleaned up periodically
@@ -96,12 +118,22 @@ export async function writeMemory(params) {
                 logger?.warn?.(`${TAG} VectorStore delete failed for ${decision.action}: ${err instanceof Error ? err.message : String(err)}`);
             }
         }
-        await fs.appendFile(filePath, JSON.stringify(record) + "\n", "utf-8");
+        try {
+            await appendRecord(JSON.stringify(record) + "\n");
+        }
+        catch (err) {
+            logger?.warn?.(`${TAG} JSONL append failed (non-fatal, VDB write continues): ${err instanceof Error ? err.message : String(err)}`);
+        }
         logger?.debug?.(`${TAG} ${decision.action} memory: removed [${decision.target_ids.join(",")}] from VectorStore → ${record.id}: ${finalContent.slice(0, 80)}...`);
     }
     else {
         // store: append a new line
-        await fs.appendFile(filePath, JSON.stringify(record) + "\n", "utf-8");
+        try {
+            await appendRecord(JSON.stringify(record) + "\n");
+        }
+        catch (err) {
+            logger?.warn?.(`${TAG} JSONL append failed (non-fatal, VDB write continues): ${err instanceof Error ? err.message : String(err)}`);
+        }
         logger?.debug?.(`${TAG} Stored memory ${record.id}: ${finalContent.slice(0, 80)}...`);
     }
     // === Vector Store dual-write ===
@@ -139,3 +171,9 @@ export async function writeMemory(params) {
 // ============================
 // Helpers
 // ============================
+function formatLocalDate(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+}

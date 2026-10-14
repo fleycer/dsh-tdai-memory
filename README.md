@@ -19,7 +19,7 @@ Part of the [DeepSeek Harness Enhancement Suite](https://github.com/Scorp1o117/d
 A port of **TencentDB Agent Memory** (Tencent Cloud's open-source four-layer
 memory system, originally an OpenClaw plugin) into DeepSeek Harness.
 
-## Compatibility (v0.5.0)
+## Compatibility (v0.6.0)
 
 This version requires DSH `0.2.0-rc.2` or a later `0.2.x` host (the manifest's
 `dsh.compatibility.dsh` range). It was verified with DSH `0.2.0-rc.2` in an
@@ -56,9 +56,49 @@ Restart the Desktop app to load the client bundle. Desktop keeps its profile und
   as dynamic context (the model "just remembers")
 - **Tools**: `tdai_memory_search` (L1 structured search),
   `tdai_conversation_search` (L0 raw-text search)
+- **Context offload (opt-in)**: Mermaid-canvas short-term memory per session
+  (upstream's −61% context-token feature), delivered as a `tdai:mmd` prompt
+  context — see the dedicated section below
 
 The data directory reuses the existing `~/.memory-tencentdb/memory-tdai`, so
 **previously accumulated memories carry over seamlessly**.
+
+## Context offload (Mermaid short-term memory, v0.6.0)
+
+The upstream `src/offload` module (vendored since v0.6.0) keeps a symbolic
+short-term memory of the running session — a Mermaid canvas of
+entities/links with per-node detail files — and injects it as compact
+context instead of raw history. Enable it in the profile patch:
+
+```yaml
+    offload:
+      enabled: true          # off by default
+      model: ''              # optional "provider/model-id"; empty = llm.model
+      dataDir: ''            # default ~/.memory-tencentdb/context-offload
+      temperature: 0.2
+      contextWindow: 200000  # model context window used for token budgets
+      mmdMaxTokenRatio: 0.2  # MMD may use up to 20% of the window
+      forceTriggerThreshold: 4
+      maxPairsPerBatch: 20
+```
+
+Any OpenAI-compatible endpoint works (the same `llm.*` connection as
+extraction, or `offload.model` to split the load). Design notes:
+
+- **Delivered as a prompt context, never spliced into history.** Upstream's
+  dangerous projection path (rewriting the session's real messages) is not
+  used; `engine.assemble()` runs on a scratch copy and the MMD lands in the
+  `tdai:mmd` context after `tdai:recall`/`tdai:profile`. DSH's compaction
+  subsystem remains the sole owner of session history.
+- **L3 history compression is disabled on purpose** (config ratios pinned
+  above any trigger): compressed scratch copies would be discarded anyway;
+  the memory-graph side effects (entries, MMD) come from tool pairs, L1.5
+  and L2 instead.
+- The MMD reflects all turns **before** the current one, so a fresh session
+  shows an empty canvas until the first turns have been processed.
+- One-shot (headless) runs flush the last offload turn inside
+  `session/flush`; upstream's own flush is fire-and-forget, so a
+  process-level kill may lose its final offload batch.
 
 ## Architecture (porting approach)
 
@@ -66,7 +106,7 @@ The data directory reuses the existing `~/.memory-tencentdb/memory-tdai`, so
 |---|---|
 | Core | The host-neutral core of `tdai-memory-openclaw-plugin` (`src/core`, `src/utils`), tsc-compiled to ESM (`vendor/tdai/`), zero changes — see [VENDOR.md](VENDOR.md) for the upstream pin and rebuild steps |
 | Host adapter | `StandaloneHostAdapter` (official standalone mode, direct OpenAI-compatible calls) |
-| dsh shell | `index.js`: config mapping, `session/event` + `session/flush` capture, `system-prompt/assemble` recall injection on `agent.ctx`, tool registration, lifecycle |
+| dsh shell | `index.js`: config mapping, `session/event` + `session/flush` capture, `system-prompt/assemble` recall injection on `agent.ctx`, context-offload wiring (`offload-runtime.js`), tool registration, lifecycle |
 | Fallback | `recall-inject.js`: preset-row recall injection (used when mounted inside an agent preset) |
 
 Recall caches expire after 30 seconds and retain at most 128 sessions per
@@ -167,9 +207,9 @@ not need it. Users who select the local backend should install and approve
   Volatile wrapper cordis hands to `apply` — a property that never exists — so
   the failure was completely silent (issue #3)
 - **Upgrades**: `vendor/tdai/` is a frozen tsc-compiled snapshot of the
-  upstream core; see [VENDOR.md](VENDOR.md) for the upstream pin, the known
-  drift (offload / Mermaid short-term compression is not ported yet) and the
-  rebuild steps
+  upstream core, synced to `@tencentdb-agent-memory/memory-tencentdb@1.0.3`
+  since v0.6.0; see [VENDOR.md](VENDOR.md) for the pin, the rebuild steps and
+  the offload integration contract
 
 ## License
 

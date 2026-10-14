@@ -1,7 +1,7 @@
 /**
  * StandaloneLLMRunner — powered by Vercel AI SDK (`ai` + `@ai-sdk/openai`).
  *
- * This runner does NOT depend on OpenClaw's `runEmbeddedPiAgent`. It is designed
+ * This runner does NOT depend on OpenClaw's embedded agent runner. It is designed
  * for the Hermes Gateway scenario where TDAI runs as an independent Node.js sidecar
  * without the OpenClaw host.
  *
@@ -12,7 +12,7 @@
  *
  * Tool sandbox:
  *   When tools are enabled, three basic file operations are exposed:
- *   `read_file`, `write_to_file`, `replace_in_file`.
+ *   `read`, `write`, `edit` — aligned with OpenClaw host tool names.
  *   All file paths are resolved relative to `workspaceDir`, enforcing sandbox boundaries.
  */
 import fsPromises from "node:fs/promises";
@@ -20,8 +20,6 @@ import path from "node:path";
 import { generateText, tool, stepCountIs, jsonSchema } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { report } from "../../core/report/reporter.js";
-import { createNoThinkFetch } from "../../utils/no-think-fetch.js";
-import { resolvePersistentSessionId, sessionHeaderOf } from "../../utils/session-header-fetch.js";
 const TAG = "[memory-tdai] [standalone-runner]";
 // Max iterations in the tool-call loop to prevent infinite loops
 const MAX_TOOL_ITERATIONS = 20;
@@ -40,7 +38,7 @@ function resolveSandboxedPath(workspaceDir, relativePath) {
 // ============================
 function createSandboxedTools(workspaceDir, logger) {
     return {
-        read_file: tool({
+        read: tool({
             description: "Read the contents of a file at the given relative path.",
             inputSchema: jsonSchema({
                 type: "object",
@@ -54,16 +52,18 @@ function createSandboxedTools(workspaceDir, logger) {
                 if (!resolved)
                     return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
                 try {
-                    return await fsPromises.readFile(resolved, "utf-8");
+                    const content = await fsPromises.readFile(resolved, "utf-8");
+                    logger?.debug?.(`${TAG} read: "${args.path}" → ${content.length} chars`);
+                    return content;
                 }
                 catch (err) {
                     const msg = err instanceof Error ? err.message : String(err);
-                    logger?.warn?.(`${TAG} read_file failed: ${msg}`);
+                    logger?.warn?.(`${TAG} read failed: ${msg}`);
                     return JSON.stringify({ error: msg });
                 }
             }),
         }),
-        write_to_file: tool({
+        write: tool({
             description: "Write content to a file at the given relative path. Creates or overwrites.",
             inputSchema: jsonSchema({
                 type: "object",
@@ -80,49 +80,80 @@ function createSandboxedTools(workspaceDir, logger) {
                 try {
                     await fsPromises.mkdir(path.dirname(resolved), { recursive: true });
                     await fsPromises.writeFile(resolved, args.content, "utf-8");
+                    logger?.debug?.(`${TAG} write: "${args.path}" → ${args.content.length} chars`);
                     return JSON.stringify({ success: true });
                 }
                 catch (err) {
                     const msg = err instanceof Error ? err.message : String(err);
-                    logger?.warn?.(`${TAG} write_to_file failed: ${msg}`);
+                    logger?.warn?.(`${TAG} write failed: ${msg}`);
                     return JSON.stringify({ error: msg });
                 }
             }),
         }),
-        replace_in_file: tool({
-            description: "Replace an exact substring in a file with new content.",
+        edit: tool({
+            description: "Apply one or more text replacements to a file. Each edit replaces an exact substring.",
             inputSchema: jsonSchema({
                 type: "object",
                 properties: {
                     path: { type: "string", description: "Relative file path." },
-                    old_str: { type: "string", description: "Exact string to find and replace." },
-                    new_str: { type: "string", description: "Replacement string." },
+                    edits: {
+                        type: "array",
+                        description: "Array of replacements to apply sequentially.",
+                        items: {
+                            type: "object",
+                            properties: {
+                                oldText: { type: "string", description: "Exact string to find." },
+                                newText: { type: "string", description: "Replacement string." },
+                            },
+                            required: ["oldText", "newText"],
+                        },
+                    },
                 },
-                required: ["path", "old_str", "new_str"],
+                required: ["path", "edits"],
             }),
             execute: (async (args) => {
                 const resolved = resolveSandboxedPath(workspaceDir, args.path);
                 if (!resolved)
                     return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
-                if (!args.old_str)
-                    return JSON.stringify({ error: "old_str cannot be empty." });
+                if (!args.edits || args.edits.length === 0)
+                    return JSON.stringify({ error: "edits array cannot be empty." });
                 try {
-                    const existing = await fsPromises.readFile(resolved, "utf-8");
-                    if (!existing.includes(args.old_str)) {
-                        return JSON.stringify({ error: `old_str not found in file "${args.path}".` });
+                    let content = await fsPromises.readFile(resolved, "utf-8");
+                    for (const edit of args.edits) {
+                        if (!edit.oldText)
+                            return JSON.stringify({ error: "oldText cannot be empty." });
+                        if (!content.includes(edit.oldText)) {
+                            return JSON.stringify({ error: `oldText not found in file "${args.path}": ${edit.oldText.slice(0, 80)}` });
+                        }
+                        content = content.replace(edit.oldText, edit.newText);
                     }
-                    const updated = existing.replace(args.old_str, args.new_str);
-                    await fsPromises.writeFile(resolved, updated, "utf-8");
+                    await fsPromises.writeFile(resolved, content, "utf-8");
+                    logger?.debug?.(`${TAG} edit: "${args.path}" → ${args.edits.length} replacement(s), ${content.length} chars`);
                     return JSON.stringify({ success: true });
                 }
                 catch (err) {
                     const msg = err instanceof Error ? err.message : String(err);
-                    logger?.warn?.(`${TAG} replace_in_file failed: ${msg}`);
+                    logger?.warn?.(`${TAG} edit failed: ${msg}`);
                     return JSON.stringify({ error: msg });
                 }
             }),
         }),
     };
+}
+/** Read-only tool subset — currently empty.
+ *
+ * Historically returned `{ read: all.read }` so the AI SDK wouldn't reject
+ * an empty tools object. In practice this caused weak models (e.g. small
+ * Doubao endpoints) to hallucinate calls like `read({"path":"."})` during
+ * pure-text tasks (L1 extraction), triggering EISDIR on the sandbox dir
+ * and burning a turn on a useless tool call.
+ *
+ * Modern AI SDK (v6) accepts an undefined `tools` field, so the runner now
+ * skips the `tools`/`stopWhen` parameters entirely when tools are disabled
+ * — see `generateText` invocation below.
+ */
+function createReadOnlyTools(_workspaceDir, _logger) {
+    return {};
 }
 // ============================
 // StandaloneLLMRunner
@@ -132,47 +163,17 @@ export class StandaloneLLMRunner {
     model;
     enableTools;
     logger;
-    customFetch;
-    sessionIdPromise;
+    /**
+     * Side-channel: 最近一次 run() 调用的 token usage。
+     * 由 MetricTrackingRunner 装饰器读取，用于精确上报 credit。
+     * 不改变 LLMRunner 接口签名。
+     */
+    lastUsage;
     constructor(opts) {
         this.config = opts.config;
         this.model = opts.model ?? opts.config.model;
         this.enableTools = opts.enableTools ?? false;
         this.logger = opts.logger;
-        this.customFetch = opts.config.disableThinking
-            ? createNoThinkFetch(opts.config.disableThinking)
-            : undefined;
-        // Resolve the persistent session id lazily (async, cached). Only needed
-        // when the session header is enabled and no fixed sessionId is set.
-        const { sendSessionHeader, sessionId, dataDir } = opts.config;
-        if (sendSessionHeader === false || (sessionId && String(sessionId).trim())) {
-            this.sessionIdPromise = Promise.resolve(String(sessionId ?? "").trim());
-        }
-        else {
-            this.sessionIdPromise = resolvePersistentSessionId(dataDir);
-        }
-    }
-    async buildProvider() {
-        const providerOptions = {
-            baseURL: this.config.baseUrl,
-            apiKey: this.config.apiKey,
-            compatibility: "compatible",
-            ...(this.customFetch ? { fetch: this.customFetch } : {}),
-        };
-        // x-opencode-session: stable per-conversation id header.
-        if (this.config.sendSessionHeader !== false) {
-            const persistentId = await this.sessionIdPromise;
-            const header = sessionHeaderOf({
-                send: this.config.sendSessionHeader,
-                headerName: this.config.sessionHeaderName,
-                sessionId: this.config.sessionId,
-                persistentId,
-            });
-            if (header) {
-                providerOptions.headers = { ...(providerOptions.headers ?? {}), ...header };
-            }
-        }
-        return createOpenAI(providerOptions);
     }
     async run(params) {
         const runStartMs = Date.now();
@@ -184,28 +185,81 @@ export class StandaloneLLMRunner {
         // Create OpenAI-compatible provider via AI SDK
         // Use "compatible" mode to call /chat/completions (not Responses API),
         // which works with all OpenAI-compatible backends (DeepSeek, Qwen, etc.)
-        const provider = await this.buildProvider();
-        // For pure text tasks like L1 extraction, avoid exposing any tools.
-        const tools = this.enableTools
-            ? createSandboxedTools(workspaceDir, this.logger)
-            : undefined;
+        const provider = createOpenAI({
+            baseURL: this.config.baseUrl,
+            apiKey: this.config.apiKey,
+            compatibility: "compatible",
+        });
+        // Select tools based on mode + storage
+        // Service mode (COS): use storage-backed tools → LLM reads/writes via StorageAdapter
+        // Standalone mode (local FS): use sandboxed FS tools → LLM reads/writes local files
+        // enableTools=false: omit tools entirely so the model cannot hallucinate calls.
+        let tools;
+        if (this.enableTools && params.storage) {
+            const { createStorageTools } = await import("./storage-tools.js");
+            tools = createStorageTools(params.storage, params.storagePrefix ?? "", this.logger);
+            this.logger?.debug?.(`${TAG} Using storage-backed tools (prefix="${params.storagePrefix ?? ""}")`);
+        }
+        else if (this.enableTools) {
+            tools = createSandboxedTools(workspaceDir, this.logger);
+        }
+        else {
+            tools = undefined; // pure-text task — never expose any tool to the model
+        }
         try {
+            // H-11 Step 2: combine internal timeout with caller-provided abortSignal
+            // (e.g. pipeline-worker lost its lock and wants the LLM call to bail out).
+            // AbortSignal.any (Node 20+) aborts when ANY of the listed signals abort.
+            const timeoutSignal = AbortSignal.timeout(timeoutMs);
+            const combinedSignal = params.abortSignal
+                ? AbortSignal.any([timeoutSignal, params.abortSignal])
+                : timeoutSignal;
             const result = await generateText({
                 model: provider.chat(this.model),
                 system: params.systemPrompt,
                 prompt: params.prompt,
-                ...(tools ? { tools } : {}),
-                stopWhen: stepCountIs(this.enableTools ? MAX_TOOL_ITERATIONS : 1),
+                // Only attach tools when actually enabled — passing an empty object
+                // (or even a tools-only-with-`read`) makes some OpenAI-compatible
+                // backends emit spurious tool calls on pure-text tasks.
+                ...(tools && Object.keys(tools).length > 0
+                    ? { tools, stopWhen: stepCountIs(MAX_TOOL_ITERATIONS) }
+                    : {}),
                 maxOutputTokens: maxTokens,
-                abortSignal: AbortSignal.timeout(timeoutMs),
+                abortSignal: combinedSignal,
+                experimental_telemetry: {
+                    isEnabled: true,
+                    functionId: params.taskId,
+                    metadata: { instanceId: params.instanceId ?? "unknown" },
+                },
             });
-            const text = result.text.trim();
+            const text = (result.text ?? "").trim();
             const totalMs = Date.now() - runStartMs;
+            // 暴露 token usage 到 side-channel（供 MetricTrackingRunner 读取）
+            if (result.usage) {
+                this.lastUsage = {
+                    promptTokens: result.usage.promptTokens ?? 0,
+                    completionTokens: result.usage.completionTokens ?? 0,
+                    totalTokens: (result.usage.promptTokens ?? 0) + (result.usage.completionTokens ?? 0),
+                };
+            }
+            else {
+                this.lastUsage = undefined;
+            }
             this.logger?.debug?.(`${TAG} run() completed: ${totalMs}ms, steps=${result.steps.length}, output=${text.length} chars`);
-            // Log tool usage if any
-            if (result.steps.length > 1) {
-                const toolCalls = result.steps.flatMap((s) => s.toolCalls ?? []);
-                this.logger?.debug?.(`${TAG} Tool calls: ${toolCalls.map((tc) => tc.toolName).join(", ")}`);
+            // Log each step's activity (tool calls + text output)
+            for (const step of result.steps) {
+                const calls = step.toolCalls ?? [];
+                const textLen = step.text?.length ?? 0;
+                if (calls.length > 0) {
+                    const callSummary = calls.map((tc) => `${tc.toolName}(${JSON.stringify(tc.input).slice(0, 120)})`).join(", ");
+                    this.logger?.debug?.(`${TAG} step[${step.stepNumber}] toolCalls: ${callSummary}`);
+                }
+                if (textLen > 0) {
+                    this.logger?.debug?.(`${TAG} step[${step.stepNumber}] text: ${textLen} chars, finishReason=${step.finishReason}`);
+                }
+                if (calls.length === 0 && textLen === 0) {
+                    this.logger?.debug?.(`${TAG} step[${step.stepNumber}] empty (no tools, no text), finishReason=${step.finishReason}`);
+                }
             }
             // Metric
             if (params.instanceId) {

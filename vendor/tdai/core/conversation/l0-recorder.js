@@ -13,11 +13,9 @@
  * - Messages are sanitized to remove injected tags (prevent feedback loops)
  * - Short/long/command messages are filtered out
  */
-import fs from "node:fs/promises";
-import path from "node:path";
 import crypto from "node:crypto";
 import { sanitizeText, stripCodeBlocks, shouldCaptureL0 } from "../../utils/sanitize.js";
-import { formatLocalDate } from "../../utils/time.js";
+import { StoragePaths } from "../storage/types.js";
 /**
  * Generate a short unique message ID.
  */
@@ -44,7 +42,7 @@ const TAG = "[memory-tdai][l0]";
  * @returns Filtered messages (for L1 to use directly), or empty array if nothing worth recording
  */
 export async function recordConversation(params) {
-    const { sessionKey, sessionId, rawMessages, baseDir, logger, originalUserText, afterTimestamp, originalUserMessageCount } = params;
+    const { sessionKey, sessionId, rawMessages, baseDir, logger, originalUserText, afterTimestamp, originalUserMessageCount, storage } = params;
     // Step 1: Position slice + extract user/assistant messages.
     //
     // Dual protection against duplicate capture:
@@ -185,13 +183,20 @@ export async function recordConversation(params) {
         lines.push(JSON.stringify(record));
     }
     const shardDate = formatLocalDate(new Date());
-    const outDir = path.join(baseDir, "conversations");
-    const outPath = path.join(outDir, `${shardDate}.jsonl`);
+    const recordKey = StoragePaths.conversation(shardDate);
     try {
-        await fs.mkdir(outDir, { recursive: true });
-        // Append each message as its own JSONL line
-        await fs.appendFile(outPath, lines.join("\n") + "\n", "utf-8");
-        logger?.debug?.(`${TAG} Recorded ${filtered.length} messages to ${outPath}`);
+        if (storage) {
+            await storage.appendFile(recordKey, lines.join("\n") + "\n");
+        }
+        else {
+            const fs = await import("node:fs/promises");
+            const path = await import("node:path");
+            const outDir = path.default.join(baseDir, "conversations");
+            const outPath = path.default.join(outDir, `${shardDate}.jsonl`);
+            await fs.default.mkdir(outDir, { recursive: true });
+            await fs.default.appendFile(outPath, lines.join("\n") + "\n", "utf-8");
+        }
+        logger?.debug?.(`${TAG} Recorded ${filtered.length} messages to ${recordKey}`);
     }
     catch (err) {
         logger?.error(`${TAG} Failed to write L0 file: ${err instanceof Error ? err.message : String(err)}`);
@@ -206,16 +211,23 @@ export async function recordConversation(params) {
  * File format: `YYYY-MM-DD.jsonl` (daily files, all sessions merged).
  * Each line is an L0MessageRecord; filtered by sessionKey at line level.
  */
-export async function readConversationRecords(sessionKey, baseDir, logger) {
-    const conversationsDir = path.join(baseDir, "conversations");
+export async function readConversationRecords(sessionKey, baseDir, logger, storage) {
     // Daily file pattern: YYYY-MM-DD.jsonl
     const dateFilePattern = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
     let entries;
     try {
-        const dirEntries = await fs.readdir(conversationsDir, { withFileTypes: true });
-        entries = dirEntries
-            .filter((entry) => entry.isFile())
-            .map((entry) => entry.name);
+        if (storage) {
+            entries = await storage.readdirNames(StoragePaths.conversationsDir, ".jsonl");
+        }
+        else {
+            const fs = await import("node:fs/promises");
+            const path = await import("node:path");
+            const conversationsDir = path.default.join(baseDir, "conversations");
+            const dirEntries = await fs.default.readdir(conversationsDir, { withFileTypes: true });
+            entries = dirEntries
+                .filter((entry) => entry.isFile())
+                .map((entry) => entry.name);
+        }
     }
     catch {
         // Directory doesn't exist yet — normal for first conversation
@@ -229,15 +241,23 @@ export async function readConversationRecords(sessionKey, baseDir, logger) {
     }
     const records = [];
     for (const fileName of targetFiles) {
-        const filePath = path.join(conversationsDir, fileName);
         let raw;
         try {
-            raw = await fs.readFile(filePath, "utf-8");
+            if (storage) {
+                raw = await storage.readFile(`${StoragePaths.conversationsDir}${fileName}`);
+            }
+            else {
+                const fs = await import("node:fs/promises");
+                const path = await import("node:path");
+                raw = await fs.default.readFile(path.default.join(baseDir, "conversations", fileName), "utf-8");
+            }
         }
         catch {
-            logger?.warn?.(`${TAG} Failed to read L0 file: ${filePath}`);
+            logger?.warn?.(`${TAG} Failed to read L0 file: ${fileName}`);
             continue;
         }
+        if (!raw)
+            continue;
         const lines = raw.split("\n").filter((line) => line.trim());
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
@@ -265,11 +285,11 @@ export async function readConversationRecords(sessionKey, baseDir, logger) {
                     });
                 }
                 else {
-                    logger?.warn?.(`${TAG} Unrecognized JSONL line format in ${filePath}:${i + 1}`);
+                    logger?.warn?.(`${TAG} Unrecognized JSONL line format in ${fileName}:${i + 1}`);
                 }
             }
             catch {
-                logger?.warn?.(`${TAG} Skipping malformed JSONL line in ${filePath}:${i + 1}`);
+                logger?.warn?.(`${TAG} Skipping malformed JSONL line in ${fileName}:${i + 1}`);
             }
         }
     }
@@ -417,4 +437,13 @@ function extractUserAssistantMessages(messages) {
         }
     }
     return result;
+}
+/**
+ * Format local date as YYYY-MM-DD.
+ */
+function formatLocalDate(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
 }

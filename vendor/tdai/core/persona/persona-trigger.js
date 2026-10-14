@@ -2,22 +2,23 @@
  * PersonaTrigger: determines whether to trigger persona generation.
  * Implements the 5 trigger conditions from the legacy system.
  */
-import fs from "node:fs/promises";
-import path from "node:path";
 import { CheckpointManager } from "../../utils/checkpoint.js";
 import { stripSceneNavigation } from "../scene/scene-navigation.js";
+import { StoragePaths } from "../storage/types.js";
 const TAG = "[memory-tdai] [trigger]";
 export class PersonaTrigger {
     dataDir;
     interval;
     logger;
+    storage;
     constructor(opts) {
         this.dataDir = opts.dataDir;
         this.interval = opts.interval;
         this.logger = opts.logger;
+        this.storage = opts.storage;
     }
     async shouldGenerate() {
-        const cpManager = new CheckpointManager(this.dataDir);
+        const cpManager = new CheckpointManager(this.dataDir, undefined, this.storage);
         const cp = await cpManager.read();
         this.logger?.debug?.(`${TAG} Evaluating: total_processed=${cp.total_processed}, last_persona_at=${cp.last_persona_at}, memories_since=${cp.memories_since_last_persona}, scenes=${cp.scenes_processed}`);
         // Priority 1: Agent explicitly requested persona update
@@ -29,21 +30,24 @@ export class PersonaTrigger {
             this.logger?.debug?.(`${TAG} Trigger P1 (explicit request): ${result.reason}`);
             return result;
         }
+        const hasSceneFiles = await this.hasSceneFiles();
+        const hasPersonaBody = await this.hasPersonaBody();
+        const hasGeneratedPersona = cp.last_persona_at > 0 || cp.last_persona_time !== "" || hasPersonaBody;
         // Priority 2: Cold start — first extraction done, no persona yet, has scene files
         if (cp.scenes_processed > 0 &&
-            cp.last_persona_at === 0 &&
-            (await this.hasSceneFiles())) {
+            !hasGeneratedPersona &&
+            hasSceneFiles) {
             const result = { should: true, reason: "首次冷启动：首次提取完成且有场景文件" };
             this.logger?.debug?.(`${TAG} Trigger P2 (cold start): scenes_processed=${cp.scenes_processed}, total_processed=${cp.total_processed}`);
             return result;
         }
         // Priority 2.5: Recovery — persona was generated before but persona.md body
         // is now empty (corrupted/missing). Regenerate to restore.
-        if (cp.last_persona_at > 0 &&
-            (await this.hasSceneFiles()) &&
-            !(await this.hasPersonaBody())) {
+        if (hasGeneratedPersona &&
+            hasSceneFiles &&
+            !hasPersonaBody) {
             const result = { should: true, reason: "恢复：persona.md 正文丢失或为空，需要重新生成" };
-            this.logger?.debug?.(`${TAG} Trigger P2.5 (recovery): last_persona_at=${cp.last_persona_at}, persona body missing`);
+            this.logger?.debug?.(`${TAG} Trigger P2.5 (recovery): last_persona_time=${cp.last_persona_time || "(empty)"}, persona body missing`);
             return result;
         }
         // Priority 3: First scene block extraction
@@ -65,11 +69,16 @@ export class PersonaTrigger {
         return { should: false, reason: "" };
     }
     async hasSceneFiles() {
-        const blocksDir = path.join(this.dataDir, "scene_blocks");
         try {
-            const files = await fs.readdir(blocksDir);
-            const hasFiles = files.some((f) => f.endsWith(".md"));
-            return hasFiles;
+            if (this.storage) {
+                const files = await this.storage.readdirNames(StoragePaths.sceneBlocksDir, ".md");
+                return files.length > 0;
+            }
+            const fs = await import("node:fs/promises");
+            const path = await import("node:path");
+            const blocksDir = path.default.join(this.dataDir, "scene_blocks");
+            const files = await fs.default.readdir(blocksDir);
+            return files.some((f) => f.endsWith(".md"));
         }
         catch {
             return false;
@@ -81,9 +90,18 @@ export class PersonaTrigger {
      * scene navigation (no actual persona content).
      */
     async hasPersonaBody() {
-        const personaPath = path.join(this.dataDir, "persona.md");
         try {
-            const raw = await fs.readFile(personaPath, "utf-8");
+            let raw;
+            if (this.storage) {
+                raw = await this.storage.readFile(StoragePaths.persona);
+            }
+            else {
+                const fs = await import("node:fs/promises");
+                const path = await import("node:path");
+                raw = await fs.default.readFile(path.default.join(this.dataDir, "persona.md"), "utf-8");
+            }
+            if (!raw)
+                return false;
             const body = stripSceneNavigation(raw).trim();
             return body.length > 0;
         }

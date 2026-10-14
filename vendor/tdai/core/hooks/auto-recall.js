@@ -9,13 +9,12 @@
  * - L3 persona injection
  * - L2 scene navigation (full injection, LLM decides relevance)
  */
-import fs from "node:fs/promises";
-import path from "node:path";
-import { formatForLLM } from "../../utils/time.js";
 import { readSceneIndex } from "../scene/scene-index.js";
 import { generateSceneNavigation, stripSceneNavigation } from "../scene/scene-navigation.js";
+import { RecallErrors, toRecallFailure } from "./recall-errors.js";
 import { buildFtsQuery } from "../store/sqlite.js";
 import { sanitizeText } from "../../utils/sanitize.js";
+import { StoragePaths } from "../storage/types.js";
 const TAG = "[memory-tdai] [recall]";
 const RECALL_TRUNCATION_SUFFIX = "…（已截断；可用 tdai_memory_search 或 tdai_conversation_search 查看详情）";
 const MIN_TRUNCATED_RECALL_LINE_CHARS = 40;
@@ -47,16 +46,38 @@ export async function performAutoRecall(params) {
             if (timer)
                 clearTimeout(timer);
         }),
+        // H-15: timeout returns a structured RecallResult.error instead of undefined
+        // so the gateway layer can distinguish "no recall results" (undefined) from
+        // "recall timed out" (result.error.code === 20001) in the response envelope.
         new Promise((resolve) => {
             timer = setTimeout(() => {
-                logger?.warn?.(`${TAG} ⚠️ Recall timed out after ${timeoutMs}ms — skipping memory injection to avoid blocking the user`);
-                resolve(undefined);
+                logger?.warn?.(`${TAG} ⚠️ Recall timed out after ${timeoutMs}ms — surfacing as RecallResult.error`);
+                resolve({
+                    prependContext: "",
+                    appendSystemContext: "",
+                    recalledL1Memories: [],
+                    recalledL3Persona: null,
+                    error: RecallErrors.dependencyTimeout("recall").recallError,
+                    partial: false,
+                });
             }, timeoutMs);
         }),
     ]);
 }
-async function performAutoRecallInner(params) {
-    const { userText, cfg, pluginDataDir, logger, vectorStore, embeddingService } = params;
+/**
+ * Core recall logic — may throw RecallFailure (or any unhandled error) when
+ * a fatal failure occurs. Wrapped by `performAutoRecallInner` which catches
+ * and translates failures into structured `RecallResult.error`.
+ *
+ * Returns:
+ *   - RecallResult — when recall succeeded and there is content to inject
+ *   - undefined    — when recall succeeded but there is nothing to inject
+ *                    (empty memory + no persona + no scene navigation)
+ *
+ * Never returns a RecallResult with `error` populated; that is the wrapper's job.
+ */
+async function performAutoRecallCore(params) {
+    const { userText, cfg, pluginDataDir, logger, vectorStore, embeddingService, storage } = params;
     const tRecallStart = performance.now();
     // Search relevant memories (L1 layer) — skip only when userText is empty/undefined
     const tSearchStart = performance.now();
@@ -74,15 +95,15 @@ async function performAutoRecallInner(params) {
         searchTiming = searchResult.timing;
         memoryLines = applyRecallBudget(memoryLines, cfg.recall, logger);
         // Extract structured RecalledMemory from formatted lines for metric reporting
-        recalledL1Memories = memoryLines.map((line) => {
+        recalledL1Memories = memoryLines.map((line, i) => {
             const match = line.match(/^-\s+\[([^\]]+)\]\s+(.+?)(?:\s*\(活动时间:.*\))?$/);
             if (match) {
                 const tag = match[1];
                 const content = match[2].trim();
                 const typePart = tag.includes("|") ? tag.split("|")[0] : tag;
-                return { content, score: 0, type: typePart };
+                return { content, score: searchResult.scores?.[i] ?? 0, type: typePart };
             }
-            return { content: line, score: 0, type: "unknown" };
+            return { content: line, score: searchResult.scores?.[i] ?? 0, type: "unknown" };
         });
     }
     const tSearchEnd = performance.now();
@@ -90,11 +111,20 @@ async function performAutoRecallInner(params) {
     const tPersonaStart = performance.now();
     let personaContent;
     try {
-        const personaPath = path.join(pluginDataDir, "persona.md");
-        const raw = await fs.readFile(personaPath, "utf-8");
-        personaContent = stripSceneNavigation(raw).trim();
-        if (!personaContent)
-            personaContent = undefined;
+        let raw;
+        if (storage) {
+            raw = await storage.readFile(StoragePaths.persona);
+        }
+        else {
+            const fs = await import("node:fs/promises");
+            const path = await import("node:path");
+            raw = await fs.default.readFile(path.default.join(pluginDataDir, "persona.md"), "utf-8");
+        }
+        if (raw) {
+            personaContent = stripSceneNavigation(raw).trim();
+            if (!personaContent)
+                personaContent = undefined;
+        }
         logger?.debug?.(`${TAG} Persona loaded: ${personaContent ? `${personaContent.length} chars` : "empty"}`);
     }
     catch {
@@ -105,10 +135,16 @@ async function performAutoRecallInner(params) {
     const tSceneStart = performance.now();
     let sceneNavigation;
     try {
-        const sceneIndex = await readSceneIndex(pluginDataDir);
+        // CR-3 fix (2026-05-19): pass `storage` so service-mode (COS) reads remote
+        // scene_index.json instead of falling back to local pluginDataDir/.metadata
+        // (which is empty on the worker pod). Also pass useCos=storage?.type==="cos"
+        // so the generated navigation references COS-style scenes/ paths and the
+        // footer mentions tdai_read_cos instead of read_file.
+        const sceneIndex = await readSceneIndex(pluginDataDir, storage);
         if (sceneIndex.length > 0) {
-            sceneNavigation = generateSceneNavigation(sceneIndex, pluginDataDir);
-            logger?.debug?.(`${TAG} Scene navigation generated: ${sceneIndex.length} scenes`);
+            const useCos = storage?.type === "cos";
+            sceneNavigation = generateSceneNavigation(sceneIndex, pluginDataDir, useCos);
+            logger?.debug?.(`${TAG} Scene navigation generated: ${sceneIndex.length} scenes (useCos=${useCos})`);
         }
     }
     catch {
@@ -175,6 +211,44 @@ async function performAutoRecallInner(params) {
     };
 }
 /**
+ * H-15 wrapper: catches errors from performAutoRecallCore and translates them
+ * into a structured RecallResult with `error` populated.
+ *
+ * Contract: this function never throws. Callers can rely on:
+ *   - returns RecallResult (possibly with `error` field) — failure with structured info
+ *   - returns RecallResult (without `error` field)        — success with content
+ *   - returns undefined                                   — success with nothing to inject
+ *
+ * The hook layer (performAutoRecall) further normalizes timeout into RecallResult.error.
+ */
+async function performAutoRecallInner(params) {
+    try {
+        return await performAutoRecallCore(params);
+    }
+    catch (err) {
+        const fail = toRecallFailure(err);
+        const re = fail.recallError;
+        // Always log at warn; for internal errors, also dump the cause at error level
+        // to make root-cause investigation possible.
+        params.logger?.warn?.(`${TAG} recall failed: code=${re.code} category=${re.category} msg="${re.message}"`);
+        if (re.category === "internal" && fail.cause) {
+            const causeStr = fail.cause instanceof Error
+                ? (fail.cause.stack ?? fail.cause.message)
+                : String(fail.cause);
+            params.logger?.error?.(`${TAG} unexpected recall error cause: ${causeStr}`);
+        }
+        return {
+            prependContext: "",
+            appendSystemContext: "",
+            recalledL1Memories: [],
+            recalledL3Persona: null,
+            recallStrategy: undefined,
+            error: re,
+            partial: false,
+        };
+    }
+}
+/**
  * Search memories and return both formatted lines and structured details.
  *
  * This is a thin wrapper around `searchMemories` that also captures
@@ -185,15 +259,15 @@ async function searchMemoriesWithDetails(userText, pluginDataDir, cfg, logger, s
     const result = await searchMemories(userText, pluginDataDir, cfg, logger, strategy, vectorStore, embeddingService);
     // Extract structured data from formatted memory lines.
     // Format: "- [type|scene] content (活动时间: ...)" or "- [type] content"
-    const memories = result.lines.map((line) => {
+    const memories = result.lines.map((line, i) => {
         const match = line.match(/^-\s+\[([^\]]+)\]\s+(.+?)(?:\s*\(活动时间:.*\))?$/);
         if (match) {
             const tag = match[1];
             const content = match[2].trim();
             const typePart = tag.includes("|") ? tag.split("|")[0] : tag;
-            return { content, score: 0, type: typePart };
+            return { content, score: result.scores?.[i] ?? 0, type: typePart };
         }
-        return { content: line, score: 0, type: "unknown" };
+        return { content: line, score: result.scores?.[i] ?? 0, type: "unknown" };
     });
     return { lines: result.lines, memories, timing: result.timing };
 }
@@ -256,7 +330,8 @@ async function searchMemories(userText, pluginDataDir, cfg, logger, strategy, ve
             const nativeMs = performance.now() - tNative;
             logger?.debug?.(`${TAG} [hybrid-native] Single-call hybrid: ${results.length} results in ${nativeMs.toFixed(0)}ms`);
             const lines = results.map((r) => formatMemoryLine(vectorResultToFormatable(r)));
-            return { lines, timing: { ftsMs: 0, embeddingMs: nativeMs, ftsHits: 0, embeddingHits: results.length } };
+            const scores = results.map((r) => r.score);
+            return { lines, scores, timing: { ftsMs: 0, embeddingMs: nativeMs, ftsHits: 0, embeddingHits: results.length } };
         }
         // Fallback: run keyword + embedding in parallel, merge with client-side RRF (SQLite path)
         return await searchHybrid(cleanText, pluginDataDir, maxResults, threshold, vectorStore, embeddingService, logger, embeddingCallOpts);
@@ -566,27 +641,24 @@ function truncateRecallLine(line, maxChars) {
     return `${cps.slice(0, maxChars - RECALL_TRUNCATION_SUFFIX.length).join("").trimEnd()}${RECALL_TRUNCATION_SUFFIX}`;
 }
 /**
- * Format an ISO 8601 timestamp to a concise, timezone-aware string for display.
- * Uses the configured timezone (via time module).
+ * Format an ISO 8601 timestamp to a concise date or datetime string.
  * - If the time part is 00:00:00 → show date only (e.g. "2025-03-01")
- * - Otherwise → show full ISO 8601 with offset (e.g. "2025-03-01T14:30:00+08:00")
+ * - Otherwise → show date + time (e.g. "2025-03-01 14:30")
  * - Returns undefined for empty/invalid inputs.
  */
 function formatTimestamp(ts) {
     if (!ts)
         return undefined;
-    const d = new Date(ts);
-    if (isNaN(d.getTime()))
-        return undefined;
-    // Check if time part is midnight UTC (date-only semantics)
+    // Try to parse ISO format: "2025-03-01T14:30:00.000Z" or "2025-03-01"
     const match = ts.match(/^(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2})(?::\d{2})?)?/);
-    if (match) {
-        const timePart = match[2];
-        if (!timePart || timePart === "00:00") {
-            return match[1]; // date-only, no timezone conversion needed
-        }
+    if (!match)
+        return undefined;
+    const datePart = match[1];
+    const timePart = match[2];
+    if (!timePart || timePart === "00:00") {
+        return datePart;
     }
-    return formatForLLM(ts);
+    return `${datePart} ${timePart}`;
 }
 /**
  * Build a FormatableMemory from a full MemoryRecord (keyword search path).

@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import fs from "node:fs/promises";
-import path from "node:path";
+import { StoragePaths } from "../storage/types.js";
 export const REPORT_CONST = {
     PLUGIN: "plugin",
 };
@@ -66,21 +65,36 @@ class LocalReporter {
 }
 // ── Instance ID (persisted per-install) ──
 let _instanceIdCache;
-export async function getOrCreateInstanceId(pluginDataDir) {
+export async function getOrCreateInstanceId(pluginDataDir, storage) {
     if (_instanceIdCache)
         return _instanceIdCache;
-    const idFile = path.join(pluginDataDir, ".metadata", "instance_id");
     try {
-        const existing = (await fs.readFile(idFile, "utf-8")).trim();
-        if (existing) {
-            _instanceIdCache = existing;
-            return existing;
+        let existing;
+        if (storage) {
+            existing = await storage.readFile(StoragePaths.instanceId);
+        }
+        else {
+            const fs = await import("node:fs/promises");
+            const path = await import("node:path");
+            existing = await fs.default.readFile(path.default.join(pluginDataDir, ".metadata", "instance_id"), "utf-8");
+        }
+        if (existing?.trim()) {
+            _instanceIdCache = existing.trim();
+            return _instanceIdCache;
         }
     }
     catch { /* file doesn't exist */ }
     const newId = randomUUID();
-    await fs.mkdir(path.dirname(idFile), { recursive: true });
-    await fs.writeFile(idFile, newId, "utf-8");
+    if (storage) {
+        await storage.writeFile(StoragePaths.instanceId, newId);
+    }
+    else {
+        const fs = await import("node:fs/promises");
+        const path = await import("node:path");
+        const idFile = path.default.join(pluginDataDir, ".metadata", "instance_id");
+        await fs.default.mkdir(path.default.dirname(idFile), { recursive: true });
+        await fs.default.writeFile(idFile, newId, "utf-8");
+    }
     _instanceIdCache = newId;
     return newId;
 }

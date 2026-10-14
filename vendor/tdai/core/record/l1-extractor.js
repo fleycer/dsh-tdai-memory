@@ -17,6 +17,9 @@ import { writeMemory, generateMemoryId } from "./l1-writer.js";
 import { CleanContextRunner } from "../../utils/clean-context-runner.js";
 import { sanitizeJsonForParse, shouldExtractL1 } from "../../utils/sanitize.js";
 import { report } from "../report/reporter.js";
+import { metricProducer } from "../report/kafka-metric-producer.js";
+import { reportL1LatencyMetrics } from "../report/metric-tracking-l1-latency.js";
+import { extractAgentId } from "../../utils/session-key.js";
 const TAG = "[memory-tdai][l1-extractor]";
 // ============================
 // Core function
@@ -32,7 +35,7 @@ const TAG = "[memory-tdai][l1-extractor]";
  * @param logger - Optional logger
  */
 export async function extractL1Memories(params) {
-    const { messages, sessionKey, sessionId, baseDir, config, logger, instanceId: metricInstanceId } = params;
+    const { messages, sessionKey, sessionId, baseDir, config, logger, instanceId: metricInstanceId, storage } = params;
     const options = params.options ?? {};
     const maxNewMessages = options.maxMessagesPerExtraction ?? 10;
     const maxBgMessages = options.maxBackgroundMessages ?? 5;
@@ -73,6 +76,7 @@ export async function extractL1Memories(params) {
             logger,
             model: options.model,
             llmRunner: options.llmRunner,
+            sessionKey,
         });
         logger?.debug?.(`${TAG} LLM detected ${scenes.length} scene(s)`);
     }
@@ -103,6 +107,20 @@ export async function extractL1Memories(params) {
     }
     logger?.debug?.(`${TAG} Total extracted memories: ${allExtracted.length} across ${scenes.length} scene(s)`);
     if (allExtracted.length === 0) {
+        // ── 评测指标：L1 提取率（提取为空的情况） ──
+        if (metricInstanceId) {
+            try {
+                const l0Count = messages.length;
+                metricProducer.send({ metric: "l0_input_count", instanceId: metricInstanceId, value: l0Count, source: "core" });
+                metricProducer.send({ metric: "l1_extracted_count", instanceId: metricInstanceId, value: 0, source: "core" });
+                if (l0Count > 0) {
+                    metricProducer.send({ metric: "l1_extraction_rate", instanceId: metricInstanceId, value: 0, source: "core" });
+                }
+            }
+            catch {
+                // 静默忽略，不影响业务逻辑
+            }
+        }
         return {
             success: true,
             extractedCount: 0,
@@ -125,8 +143,10 @@ export async function extractL1Memories(params) {
     }));
     // Step 2: Batch Conflict Detection + Write
     let storedRecords;
+    let dedupLatencyMs = null;
     if (enableDedup) {
         try {
+            const dedupStartMs = Date.now();
             const decisions = await batchDedup({
                 memories: memoriesWithIds,
                 config,
@@ -137,7 +157,27 @@ export async function extractL1Memories(params) {
                 conflictRecallTopK: options.conflictRecallTopK,
                 embeddingTimeoutMs: options.embeddingTimeoutMs,
                 llmRunner: options.llmRunner,
+                sessionKey,
             });
+            dedupLatencyMs = Date.now() - dedupStartMs;
+            // ── 评测指标：去重决策分布 ──
+            if (metricInstanceId) {
+                try {
+                    const dedupCounts = { store: 0, update: 0, merge: 0, skip: 0 };
+                    for (const d of decisions) {
+                        if (d.action in dedupCounts) {
+                            dedupCounts[d.action]++;
+                        }
+                    }
+                    metricProducer.send({ metric: "l1_dedup_store_count", instanceId: metricInstanceId, value: dedupCounts.store, source: "core" });
+                    metricProducer.send({ metric: "l1_dedup_update_count", instanceId: metricInstanceId, value: dedupCounts.update, source: "core" });
+                    metricProducer.send({ metric: "l1_dedup_merge_count", instanceId: metricInstanceId, value: dedupCounts.merge, source: "core" });
+                    metricProducer.send({ metric: "l1_dedup_skip_count", instanceId: metricInstanceId, value: dedupCounts.skip, source: "core" });
+                }
+                catch {
+                    // 静默忽略，不影响业务逻辑
+                }
+            }
             storedRecords = await applyDecisions({
                 memoriesWithIds,
                 decisions,
@@ -147,15 +187,16 @@ export async function extractL1Memories(params) {
                 logger,
                 vectorStore: options.vectorStore,
                 embeddingService: options.embeddingService,
+                storage,
             });
         }
         catch (err) {
             logger?.warn?.(`${TAG} Batch dedup failed, storing all as new: ${err instanceof Error ? err.message : String(err)}`);
-            storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, logger, options.vectorStore, options.embeddingService);
+            storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, logger, options.vectorStore, options.embeddingService, storage);
         }
     }
     else {
-        storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, logger, options.vectorStore, options.embeddingService);
+        storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, logger, options.vectorStore, options.embeddingService, storage);
     }
     logger?.info(`${TAG} Extraction complete: extracted=${extracted.length}, stored=${storedRecords.length}`);
     // ── l1_extraction metric ──
@@ -180,6 +221,33 @@ export async function extractL1Memories(params) {
             success: true,
             error: null,
         });
+    }
+    // ── 评测指标：L1 提取率 ──
+    if (metricInstanceId) {
+        try {
+            const l0Count = messages.length;
+            const l1Count = extracted.length;
+            metricProducer.send({ metric: "l0_input_count", instanceId: metricInstanceId, value: l0Count, source: "core" });
+            metricProducer.send({ metric: "l1_extracted_count", instanceId: metricInstanceId, value: l1Count, source: "core" });
+            if (l0Count > 0) {
+                metricProducer.send({ metric: "l1_extraction_rate", instanceId: metricInstanceId, value: l1Count / l0Count, source: "core" });
+            }
+        }
+        catch {
+            // 静默忽略，不影响业务逻辑
+        }
+    }
+    // ── 评测指标：L1 延迟 ──
+    try {
+        reportL1LatencyMetrics({
+            instanceId: metricInstanceId ?? "",
+            extractionLatencyMs: Date.now() - l1StartMs,
+            dedupLatencyMs,
+            hasError: false,
+        });
+    }
+    catch {
+        // 静默忽略
     }
     return {
         success: true,
@@ -228,6 +296,7 @@ async function callLlmExtraction(params) {
             systemPrompt: EXTRACT_MEMORIES_SYSTEM_PROMPT,
             taskId: "l1-extraction",
             timeoutMs: 180_000,
+            agentId: extractAgentId(params.sessionKey),
         });
     }
     return parseExtractionResult(result, logger);
@@ -294,7 +363,7 @@ function parseExtractionResult(raw, logger) {
  * Apply batch dedup decisions — write memories according to their decisions.
  */
 async function applyDecisions(params) {
-    const { memoriesWithIds, decisions, baseDir, sessionKey, sessionId, logger, vectorStore, embeddingService } = params;
+    const { memoriesWithIds, decisions, baseDir, sessionKey, sessionId, logger, vectorStore, embeddingService, storage } = params;
     const storedRecords = [];
     // Build a map from record_id → decision
     const decisionMap = new Map();
@@ -317,6 +386,7 @@ async function applyDecisions(params) {
                 logger,
                 vectorStore,
                 embeddingService,
+                storage,
             });
             if (record) {
                 storedRecords.push(record);
@@ -331,7 +401,7 @@ async function applyDecisions(params) {
 /**
  * Store all memories directly (no dedup).
  */
-async function storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, logger, vectorStore, embeddingService) {
+async function storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, logger, vectorStore, embeddingService, storage) {
     const storedRecords = [];
     for (const memoryWithId of memoriesWithIds) {
         try {
@@ -348,6 +418,7 @@ async function storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId,
                 logger,
                 vectorStore,
                 embeddingService,
+                storage,
             });
             if (record) {
                 storedRecords.push(record);

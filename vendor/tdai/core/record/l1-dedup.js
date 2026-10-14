@@ -14,6 +14,7 @@ import { CONFLICT_DETECTION_SYSTEM_PROMPT, formatBatchConflictPrompt } from "../
 import { CleanContextRunner } from "../../utils/clean-context-runner.js";
 import { sanitizeJsonForParse } from "../../utils/sanitize.js";
 import { buildFtsQuery } from "../store/sqlite.js";
+import { extractAgentId } from "../../utils/session-key.js";
 const TAG = "[memory-tdai][l1-dedup]";
 // ============================
 // Core function (batch mode)
@@ -68,20 +69,7 @@ export async function batchDedup(params) {
     if (hasVectorData && embeddingService) {
         // === Tier 1: Vector recall mode ===
         logger?.debug?.(`${TAG} Using vector recall mode (topK=${topK})`);
-        try {
-            matches = await findCandidatesByVector(memories, vectorStore, embeddingService, topK, logger, params.embeddingTimeoutMs);
-        }
-        catch (err) {
-            logger?.warn?.(`${TAG} Vector recall failed, falling back to FTS keyword: ${err instanceof Error ? err.message : String(err)}`);
-            // Degrade to FTS keyword recall
-            if (hasFts) {
-                matches = await findCandidatesByFts(memories, vectorStore, logger);
-            }
-            else {
-                logger?.debug?.(`${TAG} FTS not available either, skipping conflict detection`);
-                return storeAll();
-            }
-        }
+        matches = await findCandidatesByVector(memories, vectorStore, embeddingService, topK, logger, params.embeddingTimeoutMs);
     }
     else if (hasFts) {
         // === Tier 2: FTS keyword recall ===
@@ -100,12 +88,12 @@ export async function batchDedup(params) {
         return storeAll();
     }
     // Phase 2: Batch LLM judgment
-    return runLlmJudgment(matches, memories, config, logger, model, llmRunner);
+    return runLlmJudgment(matches, memories, config, logger, model, llmRunner, params.sessionKey);
 }
 /**
  * Phase 2: Run batch LLM judgment on candidate matches.
  */
-async function runLlmJudgment(matches, memories, config, logger, model, llmRunner) {
+async function runLlmJudgment(matches, memories, config, logger, model, llmRunner, sessionKey) {
     logger?.debug?.(`${TAG} Running batch conflict detection for ${memories.length} memories`);
     try {
         const userPrompt = formatBatchConflictPrompt(matches);
@@ -132,6 +120,7 @@ async function runLlmJudgment(matches, memories, config, logger, model, llmRunne
                 systemPrompt: CONFLICT_DETECTION_SYSTEM_PROMPT,
                 taskId: "l1-conflict-detection",
                 timeoutMs: 180_000,
+                agentId: sessionKey ? extractAgentId(sessionKey) : undefined,
             });
         }
         const decisions = parseBatchResult(result, memories, logger);

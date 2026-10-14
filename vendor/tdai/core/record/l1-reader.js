@@ -10,8 +10,7 @@
  * 2. **JSONL** (fallback): `readMemoryRecords()` / `readAllMemoryRecords()` — reads from
  *    `records/YYYY-MM-DD.jsonl` files. Used when VectorStore is unavailable or degraded.
  */
-import fs from "node:fs/promises";
-import path from "node:path";
+import { StoragePaths } from "../storage/types.js";
 const TAG = "[memory-tdai] [l1-reader]";
 // ============================
 // SQLite-based queries (preferred)
@@ -79,35 +78,52 @@ function rowToMemoryRecord(row) {
  * Current naming mode:
  * - Daily merged file: records/YYYY-MM-DD.jsonl (all sessions in one file)
  */
-export async function readMemoryRecords(sessionKey, baseDir, logger) {
-    const recordsDir = path.join(baseDir, "records");
+export async function readMemoryRecords(sessionKey, baseDir, logger, storage) {
     const dateFilePattern = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
     let entries;
     try {
-        entries = await fs.readdir(recordsDir, { withFileTypes: true });
+        if (storage) {
+            entries = await storage.readdirNames(StoragePaths.recordsDir, ".jsonl");
+        }
+        else {
+            const fs = await import("node:fs/promises");
+            const path = await import("node:path");
+            const recordsDir = path.default.join(baseDir, "records");
+            const dirEntries = await fs.default.readdir(recordsDir, { withFileTypes: true });
+            entries = dirEntries
+                .filter((entry) => entry.isFile() && dateFilePattern.test(entry.name))
+                .map((entry) => entry.name);
+        }
     }
     catch {
         // Directory doesn't exist yet
         return [];
     }
     const targetFiles = entries
-        .filter((entry) => entry.isFile() && dateFilePattern.test(entry.name))
-        .map((entry) => entry.name)
+        .filter((name) => dateFilePattern.test(name))
         .sort();
     if (targetFiles.length === 0) {
         return [];
     }
     const records = [];
     for (const fileName of targetFiles) {
-        const filePath = path.join(recordsDir, fileName);
         let raw;
         try {
-            raw = await fs.readFile(filePath, "utf-8");
+            if (storage) {
+                raw = await storage.readFile(`${StoragePaths.recordsDir}${fileName}`);
+            }
+            else {
+                const fs = await import("node:fs/promises");
+                const path = await import("node:path");
+                raw = await fs.default.readFile(path.default.join(baseDir, "records", fileName), "utf-8");
+            }
         }
         catch {
-            logger?.warn?.(`${TAG} Failed to read L1 file: ${filePath}`);
+            logger?.warn?.(`${TAG} Failed to read L1 file: ${fileName}`);
             continue;
         }
+        if (!raw)
+            continue;
         const lines = raw.split("\n").filter((line) => line.trim());
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
@@ -119,7 +135,7 @@ export async function readMemoryRecords(sessionKey, baseDir, logger) {
                 records.push(parsed);
             }
             catch {
-                logger?.warn?.(`${TAG} Skipping malformed JSONL line in ${filePath}:${i + 1}`);
+                logger?.warn?.(`${TAG} Skipping malformed JSONL line in ${fileName}:${i + 1}`);
             }
         }
     }
@@ -133,17 +149,32 @@ export async function readMemoryRecords(sessionKey, baseDir, logger) {
 /**
  * Read ALL memory records across all session JSONL files.
  */
-export async function readAllMemoryRecords(baseDir, logger) {
-    const recordsDir = path.join(baseDir, "records");
+export async function readAllMemoryRecords(baseDir, logger, storage) {
     try {
-        const files = await fs.readdir(recordsDir);
+        let files;
+        if (storage) {
+            files = await storage.readdirNames(StoragePaths.recordsDir, ".jsonl");
+        }
+        else {
+            const fs = await import("node:fs/promises");
+            const path = await import("node:path");
+            const recordsDir = path.default.join(baseDir, "records");
+            files = (await fs.default.readdir(recordsDir)).filter((f) => f.endsWith(".jsonl"));
+        }
         const allRecords = [];
         for (const file of files) {
-            if (!file.endsWith(".jsonl"))
-                continue;
-            const filePath = path.join(recordsDir, file);
             try {
-                const raw = await fs.readFile(filePath, "utf-8");
+                let raw;
+                if (storage) {
+                    raw = await storage.readFile(`${StoragePaths.recordsDir}${file}`);
+                }
+                else {
+                    const fs = await import("node:fs/promises");
+                    const path = await import("node:path");
+                    raw = await fs.default.readFile(path.default.join(baseDir, "records", file), "utf-8");
+                }
+                if (!raw)
+                    continue;
                 const lines = raw.split("\n").filter((line) => line.trim());
                 for (const line of lines) {
                     try {

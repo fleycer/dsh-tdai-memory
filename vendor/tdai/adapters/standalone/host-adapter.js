@@ -55,4 +55,8 @@ export class StandaloneHostAdapter {
     getLLMRunnerFactory() {
         return this.runnerFactory;
     }
+    resolveAgentId() {
+        // Standalone (Gateway/Hermes) has no multi-agent concept — always "main".
+        return "main";
+    }
 }

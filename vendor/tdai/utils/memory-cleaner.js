@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { ManagedTimer } from "./managed-timer.js";
-import { formatLocalDateTime, startOfLocalDay } from "./time.js";
 const TAG = "[memory-tdai][cleaner]";
 const L0_DIR_NAME = "conversations";
 const L1_DIR_NAME = "records";
@@ -247,10 +246,17 @@ function extractShardDateFromFileName(fileName) {
     return { year, month, day };
 }
 function localDayEndMs(year, month, day) {
-    // End of day = start of next day minus 1ms (in configured timezone)
-    const nextDay = new Date(Date.UTC(year, month - 1, day + 1));
-    const nextDayStartMs = startOfLocalDay(nextDay);
-    return nextDayStartMs - 1;
+    const end = new Date(year, month - 1, day, 23, 59, 59, 999);
+    return end.getTime();
+}
+function formatLocalDateTime(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
 }
 function formatUtcOffset(offsetMinutes) {
     const sign = offsetMinutes >= 0 ? "+" : "-";
@@ -261,10 +267,11 @@ function formatUtcOffset(offsetMinutes) {
 }
 function computeCutoffMsByLocalDay(nowMs, retentionDays) {
     // 自然日策略，保留"今天 + 往前 retentionDays-1 天"
-    // 删除阈值为 keepStart 当天 00:00:00.000（配置时区）
+    // 删除阈值为 keepStart 当天 00:00:00.000（本地时区）
     const now = new Date(nowMs);
-    const todayStartMs = startOfLocalDay(now);
-    const cutoffMs = todayStartMs - (retentionDays - 1) * 24 * 60 * 60 * 1000;
+    const keepStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+    keepStart.setDate(keepStart.getDate() - (retentionDays - 1));
+    const cutoffMs = keepStart.getTime();
     // Sanity check: cutoff must be strictly in the past
     if (cutoffMs >= nowMs) {
         throw new Error(`cutoff sanity failed: cutoff (${cutoffMs}) >= now (${nowMs}), ` +

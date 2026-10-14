@@ -20,11 +20,38 @@
  * - Thread-safe via WAL mode.
  */
 import { createRequire } from "node:module";
+import { mkdirSync, existsSync } from "node:fs";
+import path from "node:path";
+import { arch } from "node:process";
 const TAG = "[memory-tdai][sqlite]";
 // Use createRequire to load the experimental node:sqlite module
 const require = createRequire(import.meta.url);
 function requireNodeSqlite() {
     return require("node:sqlite");
+}
+/**
+ * Resolve the sqlite-vec native extension path (vec0.so) for Linux.
+ *
+ * openclaw 9.5 stages plugin dependencies into isolated `package-N` directories,
+ * where the platform package `sqlite-vec-linux-x64` is nested under
+ * `sqlite-vec/node_modules/` instead of being hoisted as a sibling. The
+ * `sqlite-vec` package itself hardcodes a `../sqlite-vec-linux-x64` sibling
+ * lookup that fails in that layout. We locate the nested `vec0.so` directly via
+ * the filesystem and let the caller `db.loadExtension()` it.
+ *
+ * Returns the absolute path to `vec0.so`, or `undefined` if not found.
+ */
+function resolveVec0So() {
+    try {
+        // require.resolve returns the real path (symlinks already resolved).
+        const sqliteVecEntry = require.resolve("sqlite-vec");
+        const sqliteVecDir = path.dirname(sqliteVecEntry);
+        const soPath = path.join(sqliteVecDir, "node_modules", `sqlite-vec-linux-${arch}`, "vec0.so");
+        return existsSync(soPath) ? soPath : undefined;
+    }
+    catch {
+        return undefined;
+    }
 }
 let _jieba; // undefined = not yet tried
 function getJieba() {
@@ -242,6 +269,11 @@ export class VectorStore {
     constructor(dbPath, dimensions, logger) {
         this.dimensions = dimensions;
         this.logger = logger;
+        // Ensure parent directory exists (for non-default instance paths)
+        const dbDir = path.dirname(dbPath);
+        if (!existsSync(dbDir)) {
+            mkdirSync(dbDir, { recursive: true });
+        }
         // Open database with extension support enabled
         const { DatabaseSync: DbSync } = requireNodeSqlite();
         this.db = new DbSync(dbPath, { allowExtension: true });
@@ -264,6 +296,48 @@ export class VectorStore {
         return this.degraded;
     }
     /**
+     * Try to load the sqlite-vec native extension (vec0.so).
+     *
+     * Strategy (new-then-old fallback):
+     * 1. New: resolve the nested vec0.so in openclaw 9.5's staging dir and load
+     *    it directly.
+     * 2. Fallback: if not found or load fails, fall back to sqlite-vec's own
+     *    loader — which works under the classic npm sibling layout used by older
+     *    openclaw (e.g. 8.2 / 7.2).
+     *
+     * Returns true if the extension was loaded successfully, false otherwise.
+     */
+    tryLoadVecExtension() {
+        // 1. New strategy: nested vec0.so in openclaw 9.5's staging dir.
+        const soPath = resolveVec0So();
+        if (soPath) {
+            try {
+                this.db.enableLoadExtension(true);
+                this.db.loadExtension(soPath);
+                return true;
+            }
+            catch (err) {
+                this.logger?.warn(`${TAG} loadExtension(${soPath}) failed; falling back to sqlite-vec loader: ` +
+                    `${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
+        else {
+            this.logger?.warn(`${TAG} nested vec0.so not found under sqlite-vec/node_modules/sqlite-vec-linux-${arch}; ` +
+                `falling back to sqlite-vec loader`);
+        }
+        // 2. Fallback: original sqlite-vec loader (classic npm sibling layout).
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
+            const sqliteVec = require("sqlite-vec");
+            this.db.enableLoadExtension(true);
+            sqliteVec.load(this.db);
+            return true;
+        }
+        catch {
+            return false;
+        }
+    }
+    /**
      * Load sqlite-vec extension and initialize database schema.
      * Must be called once after construction.
      *
@@ -274,19 +348,15 @@ export class VectorStore {
      *   so the caller can schedule a full re-embed.
      */
     init(providerInfo) {
-        // Load sqlite-vec extension (same approach as root project's sqlite-vec.ts)
-        try {
-            // eslint-disable-next-line @typescript-eslint/no-require-imports
-            const sqliteVec = require("sqlite-vec");
-            this.db.enableLoadExtension(true);
-            sqliteVec.load(this.db);
-        }
-        catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            this.logger?.error(`${TAG} Failed to load sqlite-vec extension: ${message}. ` +
+        // Always attempt to load the vector extension, regardless of whether
+        // embedding is enabled. On failure, degrade the whole store (same as the
+        // original behavior) so the problem stays visible instead of being masked
+        // when embedding is off.
+        if (!this.tryLoadVecExtension()) {
+            this.logger?.error(`${TAG} Failed to load sqlite-vec extension. ` +
                 `VectorStore entering degraded mode — all operations will be no-ops.`);
             this.degraded = true;
-            return { needsReindex: false, reason: `sqlite-vec load failed: ${message}` };
+            return { needsReindex: false, reason: `sqlite-vec load failed` };
         }
         // ── Schema creation & prepared statements ──────────────────────────────
         // Wrapped in try-catch: if anything fails during schema init (e.g. the DB
@@ -510,21 +580,29 @@ export class VectorStore {
         ORDER BY distance
       `);
         }
-        // L0 query statements for L1 runner (newest-first + LIMIT to bound memory)
-        // Sort/filter by recorded_at (write time) instead of timestamp (conversation time)
-        // because L1 cursor uses recorded_at semantics. ISO 8601 string comparison preserves time order.
+        // L0 query statements for L1 runner (oldest-first + LIMIT to bound memory).
+        //
+        // Why ASC: the L1 runner advances `last_l1_cursor` to max(recorded_at) of
+        // the batch it just consumed. If we returned newest-first under a backlog,
+        // the cursor would jump to the latest record and silently skip the older
+        // ones. Returning the oldest `LIMIT` rows above the cursor is the only way
+        // to guarantee progress without data loss when there is a backlog.
+        //
+        // Sort/filter by recorded_at (write time) instead of timestamp (conversation
+        // time) because L1 cursor uses recorded_at semantics. ISO 8601 string
+        // comparison preserves time order.
         this.stmtL0QueryAll = this.db.prepare(`
       SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
       FROM l0_conversations
       WHERE session_key = ?
-      ORDER BY recorded_at DESC
+      ORDER BY recorded_at ASC
       LIMIT ?
     `);
         this.stmtL0QueryAfter = this.db.prepare(`
       SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
       FROM l0_conversations
       WHERE session_key = ? AND recorded_at > ?
-      ORDER BY recorded_at DESC
+      ORDER BY recorded_at ASC
       LIMIT ?
     `);
         this.stmtL0QueryMigrationCursor = this.db.prepare(`
@@ -906,7 +984,8 @@ export class VectorStore {
         try {
             this.db.exec("BEGIN");
             try {
-                this.stmtDeleteMeta.run(recordId);
+                const result = this.stmtDeleteMeta.run(recordId);
+                const deleted = result?.changes > 0;
                 if (this.vecTablesReady)
                     this.stmtDeleteVec.run(recordId);
                 if (this.ftsAvailable) {
@@ -916,6 +995,7 @@ export class VectorStore {
                     catch { /* non-fatal */ }
                 }
                 this.db.exec("COMMIT");
+                return deleted;
             }
             catch (err) {
                 try {
@@ -924,7 +1004,6 @@ export class VectorStore {
                 catch { /* ignore rollback errors */ }
                 throw err;
             }
-            return true;
         }
         catch (err) {
             this.logger?.warn(`${TAG} delete failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
@@ -1283,7 +1362,8 @@ export class VectorStore {
         try {
             this.db.exec("BEGIN");
             try {
-                this.stmtL0DeleteMeta.run(recordId);
+                const result = this.stmtL0DeleteMeta.run(recordId);
+                const deleted = result?.changes > 0;
                 if (this.vecTablesReady)
                     this.stmtL0DeleteVec.run(recordId);
                 if (this.ftsAvailable) {
@@ -1293,6 +1373,7 @@ export class VectorStore {
                     catch { /* non-fatal */ }
                 }
                 this.db.exec("COMMIT");
+                return deleted;
             }
             catch (err) {
                 try {
@@ -1301,7 +1382,6 @@ export class VectorStore {
                 catch { /* ignore rollback errors */ }
                 throw err;
             }
-            return true;
         }
         catch (err) {
             this.logger?.warn(`${TAG} deleteL0 failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
@@ -1494,9 +1574,11 @@ export class VectorStore {
     // ── L0 query operations (for L1 runner) ──────────────────────────────────
     /**
      * Query L0 messages for a given session key, optionally filtered by recorded_at cursor.
-     * Returns messages ordered by recorded_at ASC (chronological write order).
+     * Returns up to `limit` rows with `recorded_at > afterRecordedAtMs`, ordered by
+     * recorded_at ASC (chronological write order, **oldest-first**).
      *
-     * Used by L1 runner to read L0 data from DB instead of JSONL files.
+     * Used by L1 runner to read L0 data from DB. The runner is responsible for
+     * batching/slicing the returned rows (e.g. process N, defer the rest).
      */
     queryL0ForL1(sessionKey, afterRecordedAtMs, limit = 50) {
         if (this.degraded) {
@@ -1504,7 +1586,8 @@ export class VectorStore {
             return [];
         }
         try {
-            // Query newest-first (DESC) with LIMIT, then reverse to chronological order
+            // Query oldest-first (ASC) with LIMIT — preserves backlog ordering so
+            // callers that advance a recorded_at cursor never skip older rows.
             let rows;
             if (afterRecordedAtMs && afterRecordedAtMs > 0) {
                 // Convert epoch ms to ISO string for recorded_at comparison
@@ -1516,7 +1599,6 @@ export class VectorStore {
             }
             this.logger?.info(`${TAG} [L0-query] session=${sessionKey}, afterRecordedAtMs=${afterRecordedAtMs ?? "(all)"}, ` +
                 `limit=${limit}, returned ${rows.length} row(s)`);
-            // Reverse: SQL returns newest-first (DESC), callers expect chronological order
             return rows.map((r) => ({
                 record_id: r.record_id,
                 session_key: r.session_key,
@@ -1525,7 +1607,7 @@ export class VectorStore {
                 message_text: r.message_text,
                 recorded_at: r.recorded_at || "",
                 timestamp: r.timestamp || 0,
-            })).reverse();
+            }));
         }
         catch (err) {
             this.logger?.warn(`${TAG} [L0-query] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`);
@@ -1620,6 +1702,123 @@ export class VectorStore {
      */
     isFtsAvailable() {
         return this.ftsAvailable;
+    }
+    // ── v2 API: Paginated queries ─────────────────────────────
+    /**
+     * L0 paginated query for v2 `/conversation/query`.
+     * Uses SQL WHERE + LIMIT + OFFSET, no full-table scan.
+     */
+    queryL0Paginated(filter) {
+        if (this.degraded)
+            return { rows: [], total: 0 };
+        try {
+            const conditions = [];
+            const params = [];
+            if (filter.sessionId) {
+                conditions.push("(session_key = ? OR session_id = ?)");
+                params.push(filter.sessionId, filter.sessionId);
+            }
+            if (filter.timeStartMs !== undefined) {
+                conditions.push("timestamp >= ?");
+                params.push(filter.timeStartMs);
+            }
+            if (filter.timeEndMs !== undefined) {
+                conditions.push("timestamp <= ?");
+                params.push(filter.timeEndMs);
+            }
+            const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+            // Count total
+            const countSql = `SELECT COUNT(*) AS cnt FROM l0_conversations ${where}`;
+            const countRow = this.db.prepare(countSql).get(...params);
+            const total = countRow?.cnt ?? 0;
+            // Fetch page
+            const dataSql = `SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp FROM l0_conversations ${where} ORDER BY timestamp DESC LIMIT ? OFFSET ?`;
+            const rows = this.db.prepare(dataSql).all(...params, filter.limit, filter.offset);
+            return { rows, total };
+        }
+        catch (err) {
+            this.logger?.warn(`[sqlite] queryL0Paginated failed: ${err instanceof Error ? err.message : String(err)}`);
+            return { rows: [], total: 0 };
+        }
+    }
+    /**
+     * L1 paginated query for v2 `/atomic/query`.
+     * Uses SQL WHERE + LIMIT + OFFSET, no full-table scan.
+     */
+    queryL1Paginated(filter) {
+        if (this.degraded)
+            return { rows: [], total: 0 };
+        try {
+            const conditions = [];
+            const params = [];
+            if (filter.type) {
+                conditions.push("type = ?");
+                params.push(filter.type);
+            }
+            if (filter.timeStart) {
+                conditions.push("updated_time >= ?");
+                params.push(filter.timeStart);
+            }
+            if (filter.timeEnd) {
+                conditions.push("updated_time <= ?");
+                params.push(filter.timeEnd);
+            }
+            const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+            // Count total
+            const countSql = `SELECT COUNT(*) AS cnt FROM l1_records ${where}`;
+            const countRow = this.db.prepare(countSql).get(...params);
+            const total = countRow?.cnt ?? 0;
+            // Fetch page
+            const dataSql = `SELECT record_id, content, type, priority, scene_name, session_key, session_id, timestamp_str, timestamp_start, timestamp_end, created_time, updated_time, metadata_json FROM l1_records ${where} ORDER BY updated_time DESC LIMIT ? OFFSET ?`;
+            const rows = this.db.prepare(dataSql).all(...params, filter.limit, filter.offset);
+            return { rows, total };
+        }
+        catch (err) {
+            this.logger?.warn(`[sqlite] queryL1Paginated failed: ${err instanceof Error ? err.message : String(err)}`);
+            return { rows: [], total: 0 };
+        }
+    }
+    /**
+     * Delete all L0 messages belonging to a session.
+     * Returns the count of actually deleted rows.
+     */
+    deleteL0BySession(sessionId) {
+        if (this.degraded)
+            return 0;
+        try {
+            // First get all record_ids for the session
+            const rows = this.db.prepare("SELECT record_id FROM l0_conversations WHERE session_key = ? OR session_id = ?").all(sessionId, sessionId);
+            if (rows.length === 0)
+                return 0;
+            this.db.exec("BEGIN");
+            try {
+                for (const row of rows) {
+                    this.db.prepare("DELETE FROM l0_conversations WHERE record_id = ?").run(row.record_id);
+                    if (this.vecTablesReady) {
+                        try {
+                            this.db.prepare("DELETE FROM l0_vec WHERE record_id = ?").run(row.record_id);
+                        }
+                        catch { /* vec may not exist */ }
+                    }
+                    if (this.ftsAvailable) {
+                        try {
+                            this.db.prepare("DELETE FROM l0_fts WHERE record_id = ?").run(row.record_id);
+                        }
+                        catch { /* fts may not exist */ }
+                    }
+                }
+                this.db.exec("COMMIT");
+                return rows.length;
+            }
+            catch (err) {
+                this.db.exec("ROLLBACK");
+                throw err;
+            }
+        }
+        catch (err) {
+            this.logger?.warn(`[sqlite] deleteL0BySession failed: ${err instanceof Error ? err.message : String(err)}`);
+            return 0;
+        }
     }
     /**
      * FTS5 keyword search on L1 records.

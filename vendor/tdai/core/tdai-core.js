@@ -19,6 +19,7 @@
  *   // HTTP handler calls core.handleBeforeRecall / core.handleTurnCommitted / etc.
  */
 import { performAutoRecall } from "./hooks/auto-recall.js";
+import { reportRecallMetrics } from "./report/metric-tracking-recall.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
 import { executeMemorySearch, formatSearchResponse } from "./tools/memory-search.js";
 import { executeConversationSearch, formatConversationSearchResponse } from "./tools/conversation-search.js";
@@ -26,6 +27,7 @@ import { initDataDirectories, initStores, resetStores, createPipelineManager, cr
 import { CheckpointManager } from "../utils/checkpoint.js";
 import { SessionFilter } from "../utils/session-filter.js";
 import { StandaloneLLMRunnerFactory } from "../adapters/standalone/llm-runner.js";
+import { MetricTrackingRunnerFactory } from "./report/metric-tracking-runner.js";
 const TAG = "[memory-tdai] [core]";
 // ============================
 // TdaiCore
@@ -38,6 +40,7 @@ export class TdaiCore {
     runnerFactory;
     sessionFilter;
     instanceId;
+    storage;
     // Lazy-initialized resources
     vectorStore;
     embeddingService;
@@ -85,6 +88,7 @@ export class TdaiCore {
         this.runnerFactory = opts.hostAdapter.getLLMRunnerFactory();
         this.sessionFilter = opts.sessionFilter ?? new SessionFilter([]);
         this.instanceId = opts.instanceId;
+        this.storage = opts.storage;
     }
     // ============================
     // Lifecycle
@@ -181,6 +185,7 @@ export class TdaiCore {
      */
     async handleBeforeRecall(userText, sessionKey) {
         await this.storeReady?.catch(() => { });
+        const tStart = performance.now();
         const result = await performAutoRecall({
             userText,
             actorId: "default_user",
@@ -190,7 +195,23 @@ export class TdaiCore {
             logger: this.logger,
             vectorStore: this.vectorStore,
             embeddingService: this.embeddingService,
+            storage: this.storage,
         });
+        const recallLatencyMs = performance.now() - tStart;
+        // 非侵入式上报召回指标（静默失败，绝不影响业务返回）
+        try {
+            const recallResult = result ?? {};
+            reportRecallMetrics({
+                instanceId: this.instanceId ?? "",
+                recalledL1Memories: recallResult.recalledL1Memories,
+                recallStrategy: recallResult.recallStrategy ?? "skipped",
+                recallLatencyMs,
+                hasError: !!recallResult.error,
+            });
+        }
+        catch {
+            // 静默失败
+        }
         return result ?? {};
     }
     /**
@@ -214,6 +235,7 @@ export class TdaiCore {
             vectorStore: this.vectorStore,
             embeddingService: this.embeddingService,
             bgTaskRegistry: this.bgTasks,
+            storage: this.storage,
         });
     }
     /**
@@ -312,6 +334,33 @@ export class TdaiCore {
     getScheduler() {
         return this.scheduler;
     }
+    /** Get the StorageAdapter (may be undefined in standalone/OpenClaw mode). */
+    getStorage() {
+        return this.storage;
+    }
+    /** Set the StorageAdapter (for service mode, injected by Gateway after config resolution). */
+    setStorage(adapter) {
+        this.storage = adapter;
+        this.logger.info(`${TAG} StorageAdapter set: type=${adapter.type}`);
+    }
+    /**
+     * Replace the legacy MemoryPipelineManager with a StatefulPipelineManager.
+     *
+     * When STATE_BACKEND is configured, the Gateway injects a StatefulPipelineManager
+     * that delegates all state to IStateBackend. This makes the Core process
+     * stateless — capture calls go through captureAtomic and tasks are dispatched
+     * to the Worker pool.
+     *
+     * The StatefulPipelineManager implements the same notifyConversation()/flushSession()
+     * interface as MemoryPipelineManager, so performAutoCapture works unchanged.
+     */
+    setStatefulPipelineManager(manager) {
+        // Replace scheduler with the stateful version
+        this.scheduler = manager;
+        // Mark scheduler as "started" so ensureSchedulerStarted() becomes a no-op
+        this.schedulerStartPromise = Promise.resolve();
+        this.logger.info("[tdai-core] Switched to StatefulPipelineManager (distributed mode)");
+    }
     /** Whether the scheduler has been started (or is currently starting). */
     isSchedulerStarted() {
         return this.schedulerStartPromise !== undefined;
@@ -358,21 +407,19 @@ export class TdaiCore {
                     model: this.cfg.llm.model,
                     maxTokens: this.cfg.llm.maxTokens,
                     timeoutMs: this.cfg.llm.timeoutMs,
-                    disableThinking: this.cfg.llm.disableThinking,
-                    sendSessionHeader: this.cfg.llm.sendSessionHeader,
-                    sessionHeaderName: this.cfg.llm.sessionHeaderName,
-                    sessionId: this.cfg.llm.sessionId,
-                    dataDir: this.dataDir,
                 },
                 logger: this.logger,
             });
             this.logger.debug?.(`${TAG} Using standalone LLM override: model=${this.cfg.llm.model}, baseUrl=${this.cfg.llm.baseUrl}`);
         }
+        // 用 MetricTrackingRunnerFactory 装饰器包装（非侵入式 credit 上报）
+        // Kafka 未配置时 metricProducer.send() 是 no-op，零开销
+        const trackingFactory = new MetricTrackingRunnerFactory(runnerFactory, () => this.instanceId);
         const l1LlmRunner = useStandaloneRunner
-            ? runnerFactory.createRunner({ enableTools: false })
+            ? trackingFactory.createRunner({ enableTools: false })
             : undefined;
         const l2l3LlmRunner = useStandaloneRunner
-            ? runnerFactory.createRunner({ enableTools: true })
+            ? trackingFactory.createRunner({ enableTools: true })
             : undefined;
         // L1 runner
         this.scheduler.setL1Runner(createL1Runner({
@@ -384,9 +431,10 @@ export class TdaiCore {
             logger: this.logger,
             getInstanceId: () => this.instanceId,
             llmRunner: l1LlmRunner,
+            storage: this.storage,
         }));
         // Persister
-        this.scheduler.setPersister(createPersister(this.dataDir, this.logger));
+        this.scheduler.setPersister(createPersister(this.dataDir, this.logger, this.storage));
         // L2 runner
         this.scheduler.setL2Runner(async (sessionKey, cursor) => {
             const l2Runner = createL2Runner({
@@ -397,6 +445,7 @@ export class TdaiCore {
                 logger: this.logger,
                 instanceId: this.instanceId,
                 llmRunner: l2l3LlmRunner,
+                storage: this.storage,
             });
             return l2Runner(sessionKey, cursor);
         });
@@ -410,10 +459,149 @@ export class TdaiCore {
                 logger: this.logger,
                 instanceId: this.instanceId,
                 llmRunner: l2l3LlmRunner,
+                storage: this.storage,
+                agentId: this.hostAdapter.resolveAgentId(),
             });
             await l3Runner();
         });
         this.logger.debug?.(`${TAG} Pipeline runners wired`);
+    }
+    // ============================
+    // Per-instance Store runners (multi-tenant)
+    // ============================
+    /**
+     * Run L1 extraction using an externally provided Store (for multi-instance VDB).
+     * Called by PipelineWorker when task.data.instanceId is present.
+     *
+     * Returns backlog flags (`hasMore`, `hasFullBacklog`) so the caller (the
+     * service-mode worker executor) can mirror standalone-mode pipeline-manager
+     * behavior: full backlog → enqueue next L1 immediately; small tail → defer
+     * via L1_idle timer. See pipeline-factory.ts createL1Runner for semantics.
+     */
+    async runL1WithStore(sessionKey, store, embedding, storage) {
+        const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
+        const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
+            ? this.hostAdapter.getOpenClawConfig?.()
+            : undefined;
+        let runnerFactory = this.runnerFactory;
+        if (useStandaloneRunner && this.cfg.llm.enabled && this.hostAdapter.hostType === "openclaw") {
+            runnerFactory = new StandaloneLLMRunnerFactory({
+                config: {
+                    baseUrl: this.cfg.llm.baseUrl,
+                    apiKey: this.cfg.llm.apiKey,
+                    model: this.cfg.llm.model,
+                    maxTokens: this.cfg.llm.maxTokens,
+                    timeoutMs: this.cfg.llm.timeoutMs,
+                },
+                logger: this.logger,
+            });
+        }
+        // 用 MetricTrackingRunnerFactory 装饰器包装（非侵入式 credit 上报）
+        const trackingFactory = new MetricTrackingRunnerFactory(runnerFactory, () => this.instanceId);
+        const llmRunner = useStandaloneRunner
+            ? trackingFactory.createRunner({ enableTools: false })
+            : undefined;
+        const runner = createL1Runner({
+            pluginDataDir: this.dataDir,
+            cfg: this.cfg,
+            openclawConfig,
+            vectorStore: store,
+            embeddingService: embedding,
+            logger: this.logger,
+            getInstanceId: () => this.instanceId,
+            llmRunner,
+            storage: storage ?? this.getStorage(),
+        });
+        const result = await runner({ sessionKey, msg: [], bg_msg: [] });
+        // Read accumulated credit from the tracking runner (原始浮点数，与监控侧严格一致)
+        const creditUsed = llmRunner?.accumulatedCredit ?? 0;
+        const storedCount = result?.storedCount ?? 0;
+        const hasMore = result?.hasMore ?? false;
+        const hasFullBacklog = result?.hasFullBacklog ?? false;
+        return { storedCount, creditUsed, hasMore, hasFullBacklog };
+    }
+    /**
+     * Run L2 scene extraction using an externally provided Store.
+     */
+    async runL2WithStore(sessionKey, store, storage, cursor) {
+        const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
+        const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
+            ? this.hostAdapter.getOpenClawConfig?.()
+            : undefined;
+        let runnerFactory = this.runnerFactory;
+        if (useStandaloneRunner && this.cfg.llm.enabled && this.hostAdapter.hostType === "openclaw") {
+            runnerFactory = new StandaloneLLMRunnerFactory({
+                config: {
+                    baseUrl: this.cfg.llm.baseUrl,
+                    apiKey: this.cfg.llm.apiKey,
+                    model: this.cfg.llm.model,
+                    maxTokens: this.cfg.llm.maxTokens,
+                    timeoutMs: this.cfg.llm.timeoutMs,
+                },
+                logger: this.logger,
+            });
+        }
+        // 用 MetricTrackingRunnerFactory 装饰器包装（非侵入式 credit 上报）
+        const trackingFactory = new MetricTrackingRunnerFactory(runnerFactory, () => this.instanceId);
+        const llmRunner = useStandaloneRunner
+            ? trackingFactory.createRunner({ enableTools: true })
+            : undefined;
+        const runner = createL2Runner({
+            pluginDataDir: this.dataDir,
+            cfg: this.cfg,
+            openclawConfig,
+            vectorStore: store,
+            logger: this.logger,
+            instanceId: this.instanceId,
+            llmRunner,
+            storage: storage ?? this.getStorage(),
+        });
+        const runnerResult = await runner(sessionKey, cursor);
+        const creditUsed = llmRunner?.accumulatedCredit ?? 0;
+        // L2 runner returns undefined when no new L1 records, or { skipped: true } on empty extraction
+        const skipped = (runnerResult === undefined && creditUsed === 0) || (runnerResult?.skipped === true);
+        return { creditUsed, skipped };
+    }
+    /**
+     * Run L3 persona generation using an externally provided Store.
+     */
+    async runL3WithStore(store, storage) {
+        const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
+        const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
+            ? this.hostAdapter.getOpenClawConfig?.()
+            : undefined;
+        let runnerFactory = this.runnerFactory;
+        if (useStandaloneRunner && this.cfg.llm.enabled && this.hostAdapter.hostType === "openclaw") {
+            runnerFactory = new StandaloneLLMRunnerFactory({
+                config: {
+                    baseUrl: this.cfg.llm.baseUrl,
+                    apiKey: this.cfg.llm.apiKey,
+                    model: this.cfg.llm.model,
+                    maxTokens: this.cfg.llm.maxTokens,
+                    timeoutMs: this.cfg.llm.timeoutMs,
+                },
+                logger: this.logger,
+            });
+        }
+        // 用 MetricTrackingRunnerFactory 装饰器包装（非侵入式 credit 上报）
+        const trackingFactory = new MetricTrackingRunnerFactory(runnerFactory, () => this.instanceId);
+        const llmRunner = useStandaloneRunner
+            ? trackingFactory.createRunner({ enableTools: true })
+            : undefined;
+        const runner = createL3Runner({
+            pluginDataDir: this.dataDir,
+            cfg: this.cfg,
+            openclawConfig,
+            vectorStore: store,
+            logger: this.logger,
+            instanceId: this.instanceId,
+            llmRunner,
+            storage: storage ?? this.getStorage(),
+            agentId: this.hostAdapter.resolveAgentId(),
+        });
+        await runner();
+        const creditUsed = llmRunner?.accumulatedCredit ?? 0;
+        return { creditUsed };
     }
     ensureSchedulerStarted() {
         // Fast path: already started (or starting) — every concurrent caller
@@ -429,7 +617,7 @@ export class TdaiCore {
         const scheduler = this.scheduler;
         this.schedulerStartPromise = (async () => {
             try {
-                const checkpoint = new CheckpointManager(this.dataDir, this.logger);
+                const checkpoint = new CheckpointManager(this.dataDir, this.logger, this.storage);
                 const cp = await checkpoint.read();
                 scheduler.start(checkpoint.getAllPipelineStates(cp));
                 this.logger.debug?.(`${TAG} Scheduler started`);

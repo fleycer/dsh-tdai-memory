@@ -126,8 +126,7 @@ export function shouldExtractL1(text) {
     // ── Security filters ──
     // Reject prompt-injection payloads — prevent malicious content from being
     // persisted into structured memory and re-injected on future recalls.
-    if (looksLikePromptInjection(text))
-        return false;
+    // if (looksLikePromptInjection(text)) return false;
     return true;
 }
 /**

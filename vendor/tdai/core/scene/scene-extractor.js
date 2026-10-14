@@ -15,9 +15,6 @@
  *   4. Cleanup: remove soft-deletes, sync index, update navigation
  *   5. Parse LLM text output for out-of-band persona update signals
  */
-import fs from "node:fs/promises";
-import path from "node:path";
-import { formatForLLM } from "../../utils/time.js";
 import { CleanContextRunner } from "../../utils/clean-context-runner.js";
 import { CheckpointManager } from "../../utils/checkpoint.js";
 import { BackupManager } from "../../utils/backup.js";
@@ -27,6 +24,8 @@ import { generateSceneNavigation, stripSceneNavigation } from "../scene/scene-na
 import { normalizeSceneFilenames } from "./filename-normalizer.js";
 import { buildSceneExtractionPrompt } from "../prompts/scene-extraction.js";
 import { report } from "../report/reporter.js";
+import { reportL2LatencyMetrics } from "../report/metric-tracking-l2-latency.js";
+import { StoragePaths } from "../storage/types.js";
 const TAG = "[memory-tdai] [extractor]";
 /**
  * Parse LLM text output for a persona update request signal.
@@ -54,6 +53,8 @@ export class SceneExtractor {
     timeoutMs;
     logger;
     instanceId;
+    storage;
+    agentId;
     constructor(opts) {
         this.dataDir = opts.dataDir;
         this.maxScenes = opts.maxScenes ?? 15;
@@ -61,6 +62,8 @@ export class SceneExtractor {
         this.timeoutMs = opts.timeoutMs ?? 300_000; // 5 min — LLM may do multiple tool calls
         this.logger = opts.logger;
         this.instanceId = opts.instanceId;
+        this.storage = opts.storage;
+        this.agentId = opts.agentId;
         // Use injected LLMRunner if available, otherwise fall back to CleanContextRunner
         this.runner = opts.llmRunner ?? new CleanContextRunner({
             config: opts.config,
@@ -83,21 +86,36 @@ export class SceneExtractor {
             this.logger?.debug?.(`${TAG} extract() skipped: no memories`);
             return { memoriesProcessed: 0, success: true };
         }
-        const sceneBlocksDir = path.join(this.dataDir, "scene_blocks");
-        const metadataDir = path.join(this.dataDir, ".metadata");
+        const sceneBlocksDir = this.storage ? StoragePaths.sceneBlocksDir : await (async () => { const path = await import("node:path"); return path.default.join(this.dataDir, "scene_blocks"); })();
+        const metadataDir = this.storage ? StoragePaths.metadataDir : await (async () => { const path = await import("node:path"); return path.default.join(this.dataDir, ".metadata"); })();
         // Ensure directories exist
-        await fs.mkdir(sceneBlocksDir, { recursive: true });
-        await fs.mkdir(metadataDir, { recursive: true });
+        if (this.storage) {
+            await this.storage.mkdir(StoragePaths.sceneBlocksDir);
+            await this.storage.mkdir(StoragePaths.metadataDir);
+        }
+        else {
+            const fs = await import("node:fs/promises");
+            await fs.default.mkdir(sceneBlocksDir, { recursive: true });
+            await fs.default.mkdir(metadataDir, { recursive: true });
+        }
         // Phase 1: Backup
         const backupStartMs = Date.now();
-        const cpManager = new CheckpointManager(this.dataDir);
+        const cpManager = new CheckpointManager(this.dataDir, this.logger, this.storage);
         const cp = await cpManager.read();
-        const bm = new BackupManager(path.join(this.dataDir, ".backup"));
-        await bm.backupDirectory(sceneBlocksDir, "scene_blocks", `offset${cp.total_processed}`, this.sceneBackupCount);
+        // BackupManager is only meaningful for local-fs deployments. In service
+        // mode (StorageAdapter / COS) snapshot/restore is the storage backend's
+        // responsibility, so `bm` stays undefined and the catch-block restore
+        // below short-circuits to a no-op.
+        let bm;
+        if (!this.storage) {
+            const path = await import("node:path");
+            bm = new BackupManager(path.default.join(this.dataDir, ".backup"));
+            await bm.backupDirectory(sceneBlocksDir, "scene_blocks", `offset${cp.total_processed}`, this.sceneBackupCount);
+        }
         this.logger?.debug?.(`${TAG} extract() backup phase: ${Date.now() - backupStartMs}ms`);
         // Phase 2: Load scene index
         const indexStartMs = Date.now();
-        const index = await readSceneIndex(this.dataDir);
+        const index = await readSceneIndex(this.dataDir, this.storage);
         this.logger?.debug?.(`${TAG} extract() scene index loaded: ${index.length} entries (${Date.now() - indexStartMs}ms)`);
         // Build scene summaries for the prompt (relative filenames only)
         const { summaries: sceneSummaries, filenames: existingSceneFiles } = this.buildSceneSummaries(index);
@@ -122,7 +140,17 @@ export class SceneExtractor {
         const preExtractContent = new Map();
         for (const e of index) {
             try {
-                const raw = await fs.readFile(path.join(sceneBlocksDir, e.filename), "utf-8");
+                let raw;
+                if (this.storage) {
+                    raw = await this.storage.readFile(`${StoragePaths.sceneBlocksDir}${e.filename}`);
+                }
+                else {
+                    const fs = await import("node:fs/promises");
+                    const path = await import("node:path");
+                    raw = await fs.default.readFile(path.default.join(this.dataDir, "scene_blocks", e.filename), "utf-8");
+                }
+                if (!raw)
+                    continue;
                 const block = parseSceneBlock(raw, e.filename);
                 preExtractContent.set(e.filename, block.content);
             }
@@ -132,7 +160,7 @@ export class SceneExtractor {
         const promptStartMs = Date.now();
         const memoriesJson = JSON.stringify(memories.map((m) => ({
             content: m.content,
-            created_at: m.created_at ? formatForLLM(m.created_at) : m.created_at,
+            created_at: m.created_at,
             id: m.id ?? "",
         })), null, 2);
         const currentTimestamp = formatTimestamp(new Date());
@@ -158,6 +186,10 @@ export class SceneExtractor {
                 timeoutMs: this.timeoutMs,
                 // maxTokens omitted → core uses the resolved model's maxTokens from catalog
                 workspaceDir: sceneBlocksDir,
+                // Service mode: LLM tools read/write via StorageAdapter (COS) instead of local FS
+                storage: this.storage,
+                storagePrefix: this.storage ? StoragePaths.sceneBlocksDir : undefined,
+                agentId: this.agentId,
             }) ?? "";
             llmDurationMs = Date.now() - runnerStartMs;
             this.logger?.debug?.(`${TAG} extract() LLM runner completed: ${llmDurationMs}ms`);
@@ -169,18 +201,23 @@ export class SceneExtractor {
             // Restore scene_blocks/ from the Phase 1 backup so partial LLM writes
             // (or a wiped sandbox) don't leak into the next recall cycle.
             // Fail-soft: a restore failure must never mask the original LLM error.
-            try {
-                const result = await bm.restoreLatestDirectory("scene_blocks", sceneBlocksDir);
-                if (result.restored) {
-                    this.logger?.warn(`${TAG} extract() restored scene_blocks/ from backup: ${result.from}`);
+            // In service mode (`this.storage` set) we never took a local backup,
+            // so `bm` is undefined and we skip restore — the storage backend
+            // owns its own snapshot/restore semantics.
+            if (bm) {
+                try {
+                    const result = await bm.restoreLatestDirectory("scene_blocks", sceneBlocksDir);
+                    if (result.restored) {
+                        this.logger?.warn(`${TAG} extract() restored scene_blocks/ from backup: ${result.from}`);
+                    }
+                    else {
+                        this.logger?.debug?.(`${TAG} extract() no scene_blocks backup to restore from (first run or empty)`);
+                    }
                 }
-                else {
-                    this.logger?.debug?.(`${TAG} extract() no scene_blocks backup to restore from (first run or empty)`);
+                catch (restoreErr) {
+                    const rMsg = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);
+                    this.logger?.warn(`${TAG} extract() restore failed (non-fatal, original LLM error preserved): ${rMsg}`);
                 }
-            }
-            catch (restoreErr) {
-                const rMsg = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);
-                this.logger?.warn(`${TAG} extract() restore failed (non-fatal, original LLM error preserved): ${rMsg}`);
             }
             return { memoriesProcessed: 0, success: false, error: errMsg };
         }
@@ -198,13 +235,34 @@ export class SceneExtractor {
         const cleanupStartMs = Date.now();
         let cleanedCount = 0;
         try {
-            const allFiles = (await fs.readdir(sceneBlocksDir)).filter((f) => f.endsWith(".md"));
+            let allFiles;
+            if (this.storage) {
+                allFiles = await this.storage.readdirNames(StoragePaths.sceneBlocksDir, ".md");
+            }
+            else {
+                const fs = await import("node:fs/promises");
+                allFiles = (await fs.default.readdir(sceneBlocksDir)).filter((f) => f.endsWith(".md"));
+            }
             for (const file of allFiles) {
-                const filePath = path.join(sceneBlocksDir, file);
-                const raw = await fs.readFile(filePath, "utf-8");
-                if (raw.trim().length === 0 || raw.trim() === "[DELETED]") {
+                let raw;
+                if (this.storage) {
+                    raw = await this.storage.readFile(`${StoragePaths.sceneBlocksDir}${file}`);
+                }
+                else {
+                    const fs = await import("node:fs/promises");
+                    const path = await import("node:path");
+                    raw = await fs.default.readFile(path.default.join(this.dataDir, "scene_blocks", file), "utf-8");
+                }
+                if (!raw || raw.trim().length === 0 || raw.trim() === "[DELETED]") {
                     // Empty file or [DELETED] marker — soft-delete
-                    await fs.unlink(filePath);
+                    if (this.storage) {
+                        await this.storage.unlink(`${StoragePaths.sceneBlocksDir}${file}`);
+                    }
+                    else {
+                        const fs = await import("node:fs/promises");
+                        const path = await import("node:path");
+                        await fs.default.unlink(path.default.join(this.dataDir, "scene_blocks", file));
+                    }
                     cleanedCount++;
                     this.logger?.debug?.(`${TAG} extract() removed soft-deleted file: ${file}`);
                 }
@@ -212,7 +270,14 @@ export class SceneExtractor {
                     // Check if file has only META header but no actual content
                     const block = parseSceneBlock(raw, file);
                     if (!block.content || block.content.trim().length === 0) {
-                        await fs.unlink(filePath);
+                        if (this.storage) {
+                            await this.storage.unlink(`${StoragePaths.sceneBlocksDir}${file}`);
+                        }
+                        else {
+                            const fs = await import("node:fs/promises");
+                            const path = await import("node:path");
+                            await fs.default.unlink(path.default.join(this.dataDir, "scene_blocks", file));
+                        }
                         cleanedCount++;
                         this.logger?.debug?.(`${TAG} extract() removed META-only file (no content): ${file}`);
                     }
@@ -250,7 +315,7 @@ export class SceneExtractor {
         }
         // Phase 6: Sync scene index (rebuilds from remaining non-empty files)
         const syncStartMs = Date.now();
-        await syncSceneIndex(this.dataDir);
+        await syncSceneIndex(this.dataDir, this.storage);
         this.logger?.debug?.(`${TAG} extract() scene index synced: ${Date.now() - syncStartMs}ms`);
         // Phase 7: Update persona.md navigation (GAP-4 fix)
         const navStartMs = Date.now();
@@ -280,7 +345,7 @@ export class SceneExtractor {
             let scenesUpdated = 0;
             let scenesDeleted = 0;
             try {
-                const finalIndex = await readSceneIndex(this.dataDir);
+                const finalIndex = await readSceneIndex(this.dataDir, this.storage);
                 const postFilenames = new Set();
                 for (const e of finalIndex) {
                     postFilenames.add(e.filename);
@@ -288,10 +353,19 @@ export class SceneExtractor {
                     // Read scene block content from disk
                     let content = "";
                     try {
-                        const blockPath = path.join(sceneBlocksDir, e.filename);
-                        const raw = await fs.readFile(blockPath, "utf-8");
-                        const block = parseSceneBlock(raw, e.filename);
-                        content = block.content;
+                        let raw;
+                        if (this.storage) {
+                            raw = await this.storage.readFile(`${StoragePaths.sceneBlocksDir}${e.filename}`);
+                        }
+                        else {
+                            const fs = await import("node:fs/promises");
+                            const path = await import("node:path");
+                            raw = await fs.default.readFile(path.default.join(this.dataDir, "scene_blocks", e.filename), "utf-8");
+                        }
+                        if (raw) {
+                            const block = parseSceneBlock(raw, e.filename);
+                            content = block.content;
+                        }
                     }
                     catch { /* file read failure is non-fatal */ }
                     if (oldSummary === undefined) {
@@ -339,8 +413,32 @@ export class SceneExtractor {
                 success: true,
                 error: null,
             });
+            // ── 评测指标：L2 延迟 + 场景变化 ──
+            try {
+                const postSceneCount = (await readSceneIndex(this.dataDir, this.storage)).length;
+                reportL2LatencyMetrics({
+                    instanceId: this.instanceId ?? "",
+                    extractionLatencyMs: totalMs,
+                    llmDurationMs: llmDurationMs > 0 ? llmDurationMs : null,
+                    sceneCountBefore: preExtractIndex.size,
+                    sceneCountAfter: postSceneCount,
+                    scenesCreated,
+                    scenesUpdated,
+                    scenesDeleted,
+                    hasError: false,
+                });
+            }
+            catch {
+                // 静默忽略
+            }
         }
-        return { memoriesProcessed: memories.length, success: true };
+        // Detect empty extraction: pre and post scene_index both empty means LLM didn't write anything
+        const postIndex = await readSceneIndex(this.dataDir, this.storage);
+        const emptyExtraction = preExtractIndex.size === 0 && postIndex.length === 0;
+        if (emptyExtraction) {
+            this.logger?.warn(`${TAG} extract() empty extraction detected: LLM produced no file changes`);
+        }
+        return { memoriesProcessed: memories.length, success: true, emptyExtraction };
     }
     /**
      * Build human-readable scene summaries for the prompt,
@@ -378,12 +476,18 @@ export class SceneExtractor {
      * persona + navigation when it runs.
      */
     async updateSceneNavigation() {
-        const personaPath = path.join(this.dataDir, "persona.md");
-        const index = await readSceneIndex(this.dataDir);
+        const index = await readSceneIndex(this.dataDir, this.storage);
         const nav = generateSceneNavigation(index);
         let existing = "";
         try {
-            existing = await fs.readFile(personaPath, "utf-8");
+            if (this.storage) {
+                existing = (await this.storage.readFile(StoragePaths.persona)) ?? "";
+            }
+            else {
+                const fs = await import("node:fs/promises");
+                const path = await import("node:path");
+                existing = await fs.default.readFile(path.default.join(this.dataDir, "persona.md"), "utf-8");
+            }
         }
         catch {
             // No persona file yet — PersonaGenerator will create it with navigation.
@@ -401,10 +505,16 @@ export class SceneExtractor {
             return;
         }
         const updated = nav ? `${stripped}\n\n${nav}\n` : `${stripped}\n`;
-        // persona.md is at dataDir root, no subdir needed
-        await fs.writeFile(personaPath, updated, "utf-8");
+        if (this.storage) {
+            await this.storage.writeFile(StoragePaths.persona, updated);
+        }
+        else {
+            const fs = await import("node:fs/promises");
+            const path = await import("node:path");
+            await fs.default.writeFile(path.default.join(this.dataDir, "persona.md"), updated, "utf-8");
+        }
     }
 }
 function formatTimestamp(d) {
-    return formatForLLM(d);
+    return d.toISOString();
 }

@@ -21,9 +21,9 @@ function generateL0RecordId(sessionKey, index) {
     return `l0_${sessionKey}_${Date.now()}_${index}_${crypto.randomBytes(3).toString("hex")}`;
 }
 export async function performAutoCapture(params) {
-    const { messages, sessionKey, sessionId, cfg, pluginDataDir, logger, scheduler, originalUserText, originalUserMessageCount, pluginStartTimestamp, vectorStore, embeddingService, bgTaskRegistry, } = params;
+    const { messages, sessionKey, sessionId, cfg, pluginDataDir, logger, scheduler, originalUserText, originalUserMessageCount, pluginStartTimestamp, vectorStore, embeddingService, bgTaskRegistry, storage, } = params;
     const tCaptureStart = performance.now();
-    const checkpoint = new CheckpointManager(pluginDataDir, logger);
+    const checkpoint = new CheckpointManager(pluginDataDir, logger, storage);
     // ============================
     // Step 1 + 2: L0 recording + checkpoint update (ATOMIC)
     // ============================
@@ -50,6 +50,7 @@ export async function performAutoCapture(params) {
                 originalUserText,
                 afterTimestamp,
                 originalUserMessageCount,
+                storage,
             });
             if (filteredMessages.length === 0) {
                 return null; // Nothing captured — cursor stays unchanged
